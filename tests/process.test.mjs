@@ -151,6 +151,27 @@ test("a bridge call the host rejects fails the tool, not the session", { timeout
   assert.deepEqual(describe(transcript), ["user:send", "tool:main_agent_send:error:The main session is not available.", "text:handled"]);
 });
 
+test("a side agent that also loads the installed package gets the bridge tools once", { timeout: 60_000 }, async (t) => {
+  const home = tempDir(t);
+  const pi = scriptedPi(home, [{ tools: [{ name: "main_agent_read", arguments: {} }] }, { text: "read it" }]);
+  const transcript = new Transcript();
+  const side = new SideProcess({
+    invocation: pi.invocation([...launchArgs({ bridgePath, sessionDir: path.join(home, "sessions"), trusted: true, systemPrompt: SIDE_AGENT_PROMPT }), ...pi.extraArgs, "-e", root]),
+    cwd: home,
+    env: pi.env,
+    onRecord: (record) => transcript.apply(record),
+    onBridge: (message) => message.t === "call" && side.reply({ t: "reply", id: message.id, ok: true, result: message.method === "snapshot" ? { unchanged: true } : "main session text" }),
+    onExit() {},
+  });
+  side.start();
+  t.after(() => side.stop());
+  const commands = (await side.request({ type: "get_commands" })).commands.map((command) => command.name);
+  assert.deepEqual(commands.filter((name) => name === "sa" || name === "side-agent"), [], "the host extension registers no command in the side agent");
+  await side.request({ type: "prompt", message: "read", streamingBehavior: "steer" });
+  await until(() => transcript.blocks.some((block) => block.kind === "text" && block.text === "read it"), { label: "the answer" });
+  assert.deepEqual(describe(transcript), ["user:read", "tool:main_agent_read:ok:main session text", "text:read it"]);
+});
+
 test("a handler that throws leaves the stream and later records intact", { timeout: 60_000 }, async (t) => {
   const home = tempDir(t);
   const pi = scriptedPi(home, [{ text: "still here" }]);

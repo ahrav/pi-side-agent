@@ -8,7 +8,7 @@ import { editorTheme, fakeTui, KEY, keys, markdownTheme, theme } from "./support
 const ACTIONS = ["submit", "abort", "close", "unfocus", "resize", "toggleMaximize", "cycleModel", "cycleThinking", "pickModel"];
 
 /** A focused window over an empty transcript. `calls` records the actions the window invokes. */
-function build({ rows = 30 } = {}) {
+function build({ rows = 30, markdown = markdownTheme, actions = {} } = {}) {
   const tui = fakeTui(rows, 120);
   const transcript = new Transcript();
   const calls = [];
@@ -17,7 +17,7 @@ function build({ rows = 30 } = {}) {
     tui,
     theme,
     keys,
-    markdownTheme,
+    markdownTheme: markdown,
     editorTheme,
     transcript,
     cwd: process.cwd(),
@@ -27,7 +27,7 @@ function build({ rows = 30 } = {}) {
     title: () => shown.title,
     state: () => shown.state,
     note: () => shown.note,
-    actions: Object.fromEntries(ACTIONS.map((name) => [name, (...args) => calls.push([name, ...args])])),
+    actions: { ...Object.fromEntries(ACTIONS.map((name) => [name, (...args) => calls.push([name, ...args])])), ...actions },
   });
   window.focused = true;
   return { window, transcript, tui, calls, shown };
@@ -291,4 +291,32 @@ test("a click focuses an unfocused window and leaves a focused one to the termin
   assert.equal(window.handleMouse({ type: "press", button: "left" }), undefined);
   window.focused = false;
   assert.deepEqual(window.handleMouse({ type: "press", button: "left" }), { focus: true });
+});
+
+test("a block that fails to render shows as plain text, and a frame that fails to draw does not throw", () => {
+  const heading = () => {
+    throw new Error("theme failure");
+  };
+  const { window, transcript, shown } = build({ markdown: { ...markdownTheme, heading } });
+  ask(transcript, "question", "# A heading\n\nBody text.");
+  const lines = window.render(80);
+  assert.match(body(lines), /# A heading/, "the block falls back to its source text");
+  assert.match(body(lines), /❯ question/, "other blocks render normally");
+
+  Object.defineProperty(shown, "title", { get: heading });
+  const fallback = window.render(80);
+  assert.equal(fallback.length, 1);
+  assert.match(fallback[0], /^side agent window failed to draw: theme failure/);
+  assert.equal(visibleWidth(fallback[0]), 80);
+});
+
+test("an action that throws is reported in the window instead of thrown at pi", () => {
+  const toggleMaximize = () => {
+    throw new Error("maximize failed");
+  };
+  const { window } = build({ actions: { toggleMaximize } });
+  window.handleInput(KEY.altM);
+  assert.match(window.render(100).at(-2), /maximize failed/);
+  window.handleInput("x");
+  assert.doesNotMatch(window.render(100).at(-2), /maximize failed/, "the next key clears the report");
 });

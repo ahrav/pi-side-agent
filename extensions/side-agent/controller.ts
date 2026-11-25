@@ -97,14 +97,14 @@ export class SideAgentController {
     });
     this.actions = {
       submit: (text, behavior) => this.submit(text, behavior),
-      abort: () => void this.rpc({ type: "abort" }),
+      abort: () => this.run(this.rpc({ type: "abort" })),
       close: () => this.close(),
       unfocus: () => this.overlay?.handle?.unfocus(),
       resize: (step) => this.setLayout(resizeLayout(this.config.window, step * RESIZE_STEP)),
       toggleMaximize: () => this.toggleMaximize(),
-      cycleModel: () => void this.cycleModel(),
-      cycleThinking: () => void this.cycleThinking(),
-      pickModel: () => void this.pickModel(""),
+      cycleModel: () => this.run(this.cycleModel()),
+      cycleThinking: () => this.run(this.cycleThinking()),
+      pickModel: () => this.run(this.pickModel("")),
     };
   }
 
@@ -199,7 +199,7 @@ export class SideAgentController {
     this.phase = "ready";
     for (const { text, behavior } of this.waiting.splice(0)) this.prompt(text, behavior);
     this.refresh();
-    void this.loadCommands(process);
+    this.run(this.loadCommands(process));
   }
 
   private async loadCommands(process: SideProcess): Promise<void> {
@@ -256,7 +256,7 @@ export class SideAgentController {
     const version = this.transcript.version;
     this.transcript.apply(record);
     if (record.type === "agent_settled") {
-      void this.refreshUsage(process);
+      this.run(this.refreshUsage(process));
       if (this.overlay?.handle?.isFocused() !== true && this.ctx?.hasUI) this.ctx.ui.notify(`Side agent finished. ${this.config.toggleKey} opens it.`, "info");
       this.refresh();
     } else if (record.type === "agent_start" || record.type === "thinking_level_changed") this.refresh();
@@ -323,8 +323,17 @@ export class SideAgentController {
 
   private prompt(text: string, behavior: "steer" | "followUp"): void {
     this.unanswered += 1;
-    void this.rpc({ type: "prompt", message: text, streamingBehavior: behavior }).finally(() => {
-      this.unanswered -= 1;
+    this.run(
+      this.rpc({ type: "prompt", message: text, streamingBehavior: behavior }).finally(() => {
+        this.unanswered -= 1;
+        this.refresh();
+      }),
+    );
+  }
+
+  private run(task: Promise<unknown>): void {
+    task.catch((error) => {
+      this.transcript.notice("error", errorText(error));
       this.refresh();
     });
   }
@@ -365,13 +374,13 @@ export class SideAgentController {
         this.transcript.notice("info", HELP);
         break;
       case "model":
-        void this.pickModel(args);
+        this.run(this.pickModel(args));
         break;
       case "thinking":
-        void this.setThinking(args);
+        this.run(this.setThinking(args));
         break;
       case "new":
-        void this.newSession();
+        this.run(this.newSession());
         break;
       case "size":
         this.applyLayout(parseSize(args, this.config.window));
@@ -383,10 +392,10 @@ export class SideAgentController {
         this.sendToMain(args);
         break;
       case "copy":
-        void this.copyAnswer();
+        this.run(this.copyAnswer());
         break;
       case "compact":
-        void this.rpc(args ? { type: "compact", customInstructions: args } : { type: "compact" });
+        this.run(this.rpc(args ? { type: "compact", customInstructions: args } : { type: "compact" }));
         break;
       case "quit":
         this.stopping = true;
@@ -490,7 +499,7 @@ export class SideAgentController {
       const label = `${model.provider}/${model.id}`;
       return { value: String(index), label, description: model.name && model.name !== model.id ? model.name : undefined, pinned: scoped.has(label) };
     });
-    const choose = (item: PickerItem) => void this.setModel({ provider: models[Number(item.value)].provider, id: models[Number(item.value)].id });
+    const choose = (item: PickerItem) => this.run(this.setModel({ provider: models[Number(item.value)].provider, id: models[Number(item.value)].id }));
     const matches = query ? fuzzyFilter(items, query, (item) => item.label) : [];
     const exact = items.find((item) => item.label === query) ?? (matches.length === 1 ? matches[0] : undefined);
     if (exact) choose(exact);

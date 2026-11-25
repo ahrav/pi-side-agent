@@ -153,7 +153,12 @@ export function renderBlock(block: Block, width: number, style: RenderStyle): st
 export function blockLines(block: Block, width: number, style: RenderStyle): string[] {
   const key = `${width}:${block.version}:${style.expandTools ? 1 : 0}${style.showThinking ? 1 : 0}:${style.epoch}`;
   if (block.cache?.key === key) return block.cache.lines;
-  const lines = renderBlock(block, width, style);
+  let lines: string[];
+  try {
+    lines = renderBlock(block, width, style);
+  } catch {
+    lines = wrapPlain(block.kind === "tool" ? `${block.name} ${block.args}` : block.text, width);
+  }
   block.cache = { key, lines };
   return lines;
 }
@@ -175,6 +180,7 @@ export class SideWindow implements Component, Focusable {
   private viewRows = 1;
   private frameTimer: NodeJS.Timeout | undefined;
   private lastFrameAt = 0;
+  private fault = "";
 
   constructor(deps: WindowDeps) {
     this.deps = deps;
@@ -243,13 +249,30 @@ export class SideWindow implements Component, Focusable {
   }
 
   render(width: number): string[] {
+    try {
+      return this.draw(width);
+    } catch (error) {
+      return [fit(`side agent window failed to draw: ${error instanceof Error ? error.message : String(error)}`, width)];
+    }
+  }
+
+  handleInput(data: string): void {
+    try {
+      this.input(data);
+    } catch (error) {
+      this.fault = error instanceof Error ? error.message : String(error);
+    }
+    this.touch();
+  }
+
+  private draw(width: number): string[] {
     const { deps } = this;
     const rows = deps.rows();
     const inner = Math.max(10, width - 2);
     const editorLines = this.editor.render(inner);
     const title = deps.title();
     const state = deps.state();
-    const note = deps.note();
+    const note = deps.note() || this.fault;
     const key = `${width}:${rows}:${deps.transcript.version}:${this.revision}:${title}\n${state}\n${note}\n${editorLines.join("\n")}`;
     if (this.frame && key === this.frameKey) return this.frame;
 
@@ -287,11 +310,11 @@ export class SideWindow implements Component, Focusable {
     return undefined;
   }
 
-  handleInput(data: string): void {
+  private input(data: string): void {
     const { keys, actions } = this.deps;
+    this.fault = "";
     if (this.picker) {
       this.pickerInput(data);
-      this.touch();
       return;
     }
     if (matchesKey(data, this.deps.toggleKey as KeyId)) actions.unfocus();
@@ -315,7 +338,6 @@ export class SideWindow implements Component, Focusable {
       if (this.editor.getText()) this.editor.setText("");
       else actions.close();
     } else this.editor.handleInput(data);
-    this.touch();
   }
 
   private submitFollowUp(): void {
