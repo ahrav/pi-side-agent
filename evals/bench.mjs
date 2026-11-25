@@ -171,8 +171,8 @@ function benchRender() {
 }
 
 // A real pi process streams a scripted answer into a transcript. With `draw`, a window renders it through a fake
-// TUI that draws at most one frame every 16 ms, as pi's renderer does. With `monitor`, the event-loop delay of
-// this process is sampled every millisecond, which itself costs CPU, so CPU time is read from runs without it.
+// TUI that draws at most one frame every 16 ms. With `monitor`, the event-loop delay of this process is sampled
+// every millisecond. Sampling costs CPU, so the CPU figures come from the runs with `monitor` off.
 async function liveRun({ draw, monitor, chars, paceMs }) {
   const home = fs.mkdtempSync(path.join(tmpdir(), "side-bench-"));
   const script = [{ text: markdown(chars * 0.8), paceMs, tools: [{ name: "bash", arguments: { command: 'for i in $(seq 1 400); do echo "output line $i of the tool"; done' } }] }, { text: markdown(chars * 0.2), paceMs }];
@@ -233,8 +233,8 @@ async function liveRun({ draw, monitor, chars, paceMs }) {
 async function benchLive() {
   const share = (run) => `${ms(run.cpuMs)} = ${((run.cpuMs / run.elapsed) * 100).toFixed(1)}% of one core`;
   const nanos = (value) => ms(value / 1e6);
-  // The scripted provider emits five characters per delta: a 10 ms pace is about 90 deltas a second, the rate of a
-  // fast model, and a 1 ms pace is about 870 a second.
+  // The scripted provider emits five characters per delta. `paceMs` sets the delay between deltas: 10 ms gives
+  // the model-rate stream and 1 ms gives the fast stream. Each row reports the record rate it measured.
   for (const [label, chars, paceMs] of [["model-rate stream", 4000, 10], ["fast stream", 30_000, 1]]) {
     const closed = await liveRun({ draw: false, monitor: false, chars, paceMs });
     const open = await liveRun({ draw: true, monitor: false, chars, paceMs });
@@ -252,7 +252,7 @@ async function benchLive() {
   report("live", "event-loop delay of the same process when idle: p50 / p99 / max", `${nanos(idle.percentile(50))} / ${nanos(idle.percentile(99))} / ${nanos(idle.max)}`);
 }
 
-// Starts `pi` from PATH with the user's configuration, as the extension does, and reports startup and memory.
+// Starts `pi` from PATH with the user's configuration and the bridge extension, and reports startup and memory.
 async function benchReal() {
   const home = fs.mkdtempSync(path.join(tmpdir(), "side-bench-"));
   const started = performance.now();

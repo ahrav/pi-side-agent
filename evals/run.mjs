@@ -2,7 +2,9 @@
 // main agent behind the bridge, and grades what the side agent does with each prompt.
 //
 //   node evals/run.mjs [--model <provider/id>] [--thinking <level>] [--trials <n>] [--only <name,name>]
-//                      [--timeout <seconds per run>] [--pi <command>]
+//                      [--timeout <seconds>] [--pi <command>]
+//
+// `--timeout` bounds one scenario run and defaults to 240. `--pi` names the pi executable and defaults to `pi`.
 //
 // Each scenario runs in a fresh side session. Results are printed and saved under .eval-runs/.
 import * as fs from "node:fs";

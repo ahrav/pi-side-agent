@@ -16,4 +16,4 @@ MIT License, Copyright (c) Dan Bachelder. Full text: see the upstream LICENSE.
 in the subagent example extension of https://github.com/earendil-works/pi
 (`packages/coding-agent/examples/extensions/subagent/index.ts`), MIT License.
 
-Full license text and copyright notice: see the upstream LICENSE.
+The upstream LICENSE holds the full license text and the copyright notice.

@@ -43,8 +43,8 @@ Run `/reload` or restart pi. To try it for one session without installing:
 pi -e /path/to/pi-side-agent
 ```
 
-It needs Node.js 22.19 or newer. It is built and tested against pi 1.6.1;
-older pi versions are untested.
+It needs Node.js 22.19 or newer. It is built and tested against pi 1.6.1.
+Older pi versions are untested.
 
 ## Use
 
@@ -170,8 +170,8 @@ then run `/reload`:
 }
 ```
 
-`toggleKey` takes pi's key syntax, such as `ctrl+alt+k`. On macOS, alt keys
-need a terminal that sends Option as Meta.
+`toggleKey` takes pi's key syntax, such as `ctrl+alt+k`. On macOS, an alt key
+needs a terminal that sends Option as Meta.
 
 ## How it works
 
@@ -208,7 +208,8 @@ main pi process                                   side agent process
 
 ## Performance
 
-The side agent must not slow the main agent. The design follows from that:
+The side agent must not slow the main agent. The design follows from that
+requirement:
 
 - The side agent's model calls and tools run in its own process.
 - Before you open the window, the extension registers two commands, one
@@ -224,7 +225,7 @@ The side agent must not slow the main agent. The design follows from that:
   times the cost of the last frame. Drawing a streaming answer of 80,000
   characters took 2% of one core. A closed window draws nothing.
 
-The tests check the last four properties.
+The tests check the last four of these properties.
 
 Measured with `npm run bench` on an Apple M5 Pro, Node 24, pi 1.6.1:
 
@@ -244,9 +245,10 @@ Measured with `npm run bench` on an Apple M5 Pro, Node 24, pi 1.6.1:
 | Side agent memory with that configuration | 400 MB resident |
 
 Three models measured through this extension streamed 31, 51, and 96 text
-deltas a second, so the 93 records/s rows are the realistic case and the 873
-records/s row is a stress case. The stream rows use a scripted provider, so
-they measure this extension and pi's RPC stream without model latency.
+deltas a second. The 93 records/s rows are therefore the realistic case, and
+the 873 records/s row is a stress case. The stream rows use a scripted
+provider, so they measure this extension and pi's RPC stream without model
+latency.
 
 ## Evaluation
 

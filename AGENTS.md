@@ -32,7 +32,7 @@ cost. `evals/run.mjs` grades live-model runs.
   so before running it for someone else.
 - Never append a comment-lint `allow(...)` override marker. Rewrite or delete
   the comment instead. `.githooks/pre-commit` checks staged additions with
-  `scripts/forbid-comment-markers.sh --staged`; enable it with
+  `scripts/forbid-comment-markers.sh --staged`. Enable it with
   `git config --local core.hooksPath .githooks`.
 
 ## Invariants
