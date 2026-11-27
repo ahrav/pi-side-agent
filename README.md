@@ -21,7 +21,7 @@ send the main agent messages.
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
-│ alt+a main · esc close · pgup/pgdn scroll · alt+m max · alt+=/- size · /help             │
+│ alt+a main · esc hide · pgup/pgdn scroll · alt+m max · alt+=/- size · /help              │
 ╰──────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -72,7 +72,7 @@ current step, and the time since you sent the message:
 │ ◐ bash cargo build --target x86_64-unknown-linux-gnu                                     │
 │                                                                                          │
 │ ⏳ queued: also check the CI log                                                         │
-│ ⠹ Running bash… 12s · esc stops                                                          │
+│ ⠸ Running bash… 12s · ctrl+c stops                                                       │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
 ```
 
@@ -82,9 +82,32 @@ are `Starting the side agent`, `Sending`, `Waiting for the model`, `Thinking`,
 `Compacting context`. A message you send during a run is queued. It shows as
 `⏳ queued` until the side agent takes it.
 
-Esc stops a running side turn. Esc on an idle window closes it. The side agent
-keeps running while the window is closed, and pi shows a notice when it
-finishes.
+### Leaving the window while the side agent works
+
+The side agent keeps working when its window is closed, so you can go back to
+the main agent at any point.
+
+| Key | Effect |
+|---|---|
+| `esc` | Closes the window. The side agent keeps working, and focus returns to the main editor. |
+| `alt+a` | Moves focus to the main editor and leaves the window on screen. From the main editor it opens the window again. |
+| `ctrl+c` | Clears the draft. With an empty composer it stops the side agent's work, and the window stays open. Pressed again, it closes the window. |
+
+The first `ctrl+c` keeps the window so that you can redirect a stopped run.
+After `esc` closes the window, keys go to the main editor, where `esc`
+interrupts a running main agent.
+
+While the window is closed, pi's footer shows `side agent working…`. When the
+run ends, pi prints `Side agent finished. alt+a opens it.` and the footer shows
+`side agent done` until you open the window. A run that ends in an error is
+reported as `side agent failed`. A dialog that a side agent tool opens appears
+in the main UI while the window is closed.
+
+`ctrl+c` stops a model request, a running tool, a retry, or a compaction.
+Messages that were queued or had not reached the model return to the composer.
+The side session stays, so the next message continues the conversation.
+`ctrl+c` twice stops the work and closes the window, and pi prints no
+completion notice for the stopped run.
 
 ### Window size
 
@@ -171,7 +194,7 @@ Any other `/command` runs in the side agent: skills (`/skill:name`), prompt
 templates, and extension commands. The composer completes both sets.
 
 Other keys: `alt+enter` queues a follow-up message, `ctrl+o` shows tool output,
-`ctrl+t` folds thinking, and `ctrl+c` clears the draft, then closes the window.
+and `ctrl+t` folds thinking.
 
 ## Configuration
 
@@ -242,49 +265,64 @@ requirement:
   rendered again.
 - While the side agent streams, frames are spaced by at least 50 ms and by 50
   times the cost of the last frame. Drawing a streaming answer of 80,000
-  characters took 2% of one core. A closed window draws nothing.
-- The activity line advances ten times a second through the same frame
+  characters took 2% of one core.
+- The activity line advances four times a second through the same frame
   spacing. Each draw of a working window sets one timer for the next spinner
-  frame, so a closed, hidden, or idle window sets no timer.
+  frame, so an idle window sets no timer.
+- A closed window draws nothing and sets no timer. While it is closed, the
+  extension writes pi's footer status when the status text changes, which is
+  twice for a run.
 
-The tests check the last five of these properties.
+The tests check the last six of these properties.
 
 Measured with `npm run bench` on an Apple M5 Pro, Node 24, pi 1.6.1:
 
 | Measurement | Result |
 |---|---|
-| Load the extension at pi startup | 29 ms to import, 0.3 ms to register |
-| Read one run of 5.9 MB (3,000 deltas, 120 tool updates) | 4.1 ms; 0.9 MB parsed |
+| Load the extension at pi startup | 28 to 32 ms to import, 0.3 ms to register |
+| Read one run of 5.9 MB (3,000 deltas, 120 tool updates) | 3.7 to 4.3 ms; 0.9 MB parsed |
 | Draw an unchanged frame | under 1 µs |
-| Draw a frame at the end of a 10-block or 10,000-block transcript | 0.4 to 0.5 ms |
-| Draw a frame of a streaming 20,000-character answer | 1.2 ms, one frame per 61 ms |
-| Draw a frame that advances the activity spinner | 50 to 60 µs |
-| Main-process CPU while the side agent streams at 93 records/s, window closed | 1.5% of one core |
-| Same, window open | 3.3% of one core |
-| Main-process CPU at 873 records/s, window closed / open | 3.9% / 6.5% of one core |
-| Main-process CPU while the side agent waits on the model, window closed / open | 0.0% / 0.3% of one core |
-| Event-loop delay while streaming, p99 / max | 2 ms / 8 to 12 ms |
-| Event-loop delay of the same process when idle, p99 / max | 1.3 ms / 2.4 ms |
+| Draw a frame at the end of a 10-block or 10,000-block transcript | 0.4 to 0.6 ms |
+| Draw a frame of a streaming 20,000-character answer | 1.2 to 1.4 ms, one frame per 59 to 71 ms |
+| Draw a frame that advances the activity spinner | 45 to 65 µs |
+| Main-process CPU while the side agent streams at 90 records/s, window closed | 1.2 to 1.4% of one core |
+| Same, window open | 3.0 to 3.6% of one core |
+| Same, through the window's controller after `esc` closes the window | 1.1 to 1.3% of one core; 2 footer status writes, no frame requested |
+| Main-process CPU at 800 records/s, window closed / open | 3.4 to 4.4% / 5.7 to 6.4% of one core |
+| Main-process CPU while the side agent waits on the model, window closed / open | 0.0% / 0.1 to 0.4% of one core |
+| Event-loop delay while streaming, p99 / max | 2 ms / 5 to 15 ms |
+| Event-loop delay of the same process when idle, p99 / max | 1.3 ms / 2.5 ms |
 | Side agent start with a 20-package configuration | 2.5 s until ready |
 | Side agent memory with that configuration | 400 MB resident |
 
 Three models measured through this extension streamed 31, 51, and 96 text
-deltas a second. The 93 records/s rows are therefore the realistic case, and
-the 873 records/s row is a stress case. The stream rows use a scripted
+deltas a second. The 90 records/s rows are therefore the realistic case, and
+the 800 records/s row is a stress case. The stream rows use a scripted
 provider, so they measure this extension and pi's RPC stream without model
-latency.
+latency. Each range covers the benchmark runs made for this table.
 
-The benchmark draws only the side window. In a pi session, each spinner frame
-also makes pi redraw its screen. In one interactive session with a 20-package
-configuration, the main process used 0.32 s of CPU in 30 s (1.1% of one core)
-while the side agent ran a tool with the window open, 0.18 s with the window
-closed, and 0.06 s with the window open and the side agent idle.
+The benchmark draws only the side window. In a pi session, each frame the
+window requests also makes pi lay out its screen, composite the overlay, and
+render its footer, and that costs more than the window's own draw. Measured in
+interactive sessions (pi 1.7.0, 20 packages, a git repository) while the side
+agent ran a tool:
+
+| Terminal | Window open | Window closed with `esc` |
+|---|---|---|
+| 150 x 45 | 0.60 s of main-process CPU in 30 s, 2.0% of one core | 0.11 s, 0.4% of one core |
+| 240 x 70 | 0.66 s of main-process CPU in 30 s, 2.2% of one core | 0.11 s, 0.4% of one core |
+
+Each figure is the median of three 30-second spans. The spinner advances four
+times a second because of this cost: at ten frames a second the same sessions
+used 0.97 s and 1.55 s.
 
 ## Evaluation
 
 `npm run eval` starts the side agent with your pi configuration and a real
-model, puts a simulated main agent behind the bridge, and grades each run on
-the tools it called and its answer.
+model, puts a simulated main agent behind the bridge, and grades each run.
+
+The agent scenarios send one prompt and grade the tools the side agent called
+and its answer:
 
 | Scenario | Checks |
 |---|---|
@@ -298,20 +336,46 @@ the tools it called and its answer.
 | `skills-access` | Names skills from the configured skill set |
 | `mcp-access` | Calls an MCP tool |
 
-Results on the author's configuration (pi 1.6.1, 20 packages, 401 skills, an
-MCP gateway, models on Amazon Bedrock):
+The window scenarios run the side window's controller and press its keys
+while the model works:
 
-| Model | Scenarios | Passed |
+| Scenario | Checks |
+|---|---|
+| `hidden-run-finishes` | `esc` during a tool call closes the window and the footer reads working. The run finishes, pi reports it, and the reopened window shows the answer. |
+| `hidden-run-messages-main` | With the window closed, the side agent runs a tool and then sends the main agent one message |
+| `hidden-run-asks-main` | With the window closed, the side agent asks the main agent a question and its answer carries the reply |
+| `stop-then-redirect` | `ctrl+c` stops a running tool within 5 seconds and keeps the window. The stopped run produces no answer, and the next prompt is answered. |
+| `stop-returns-queue` | `ctrl+c` returns a queued steering message and a queued follow-up to the composer, and no run follows |
+| `stop-and-close` | `ctrl+c` twice closes the window at once and stops the run. pi prints no notice, and the side agent process keeps running. |
+
+Every window scenario also checks that the window reports idle afterwards.
+
+Results on the author's configuration (20 packages, 401 skills, an MCP
+gateway, models on Amazon Bedrock). The agent scenarios ran on pi 1.6.1:
+
+| Model | Agent scenarios | Passed |
 |---|---|---|
 | Claude Haiku 5.5, thinking off | all 9, 2 trials | 18 of 18 |
 | Claude Fable 5.2, thinking medium | all 9 | 9 of 9 |
 | Claude Sonnet 5.5 | the 5 main-agent scenarios | 5 of 5 |
 | GPT-6.2 Sol | the 5 main-agent scenarios | 5 of 5 |
 
+The window scenarios ran on pi 1.7.0:
+
+| Model | Window scenarios | Passed |
+|---|---|---|
+| Claude Haiku 5.5, thinking off | all 6, 2 trials | 12 of 12 |
+| Claude Fable 5.2, thinking medium | all 6 | 6 of 6 |
+| GPT-6.2 Sol | all 6 | 6 of 6 |
+
+In the `stop-then-redirect` runs, the side agent was idle 61 to 84 ms after
+`ctrl+c`.
+
 In `relays-message` every model chose `follow_up` delivery for "once it
 finishes". Pass `--model <provider/id>`, `--thinking <level>`, `--trials <n>`,
-and `--only <names>` to `node evals/run.mjs`. The last three scenarios skip
-when the configuration has no web, skill, or MCP tools.
+and `--only <names>` to `node evals/run.mjs`; `--only agent` and
+`--only window` select a group. The last three agent scenarios skip when the
+configuration has no web, skill, or MCP tools.
 
 ## Costs and limits
 
@@ -326,6 +390,8 @@ when the configuration has no web, skill, or MCP tools.
   task to the main agent.
 - The window is an overlay, so it covers the part of the main transcript
   behind it. Dock it to an edge or close it to see the main transcript.
+- pi composites an open window into every frame it draws. Close the window
+  with `esc` while you work with the main agent, and that cost is gone.
 - pi fixes an overlay's width and position when it is shown. The extension
   reopens the window on those changes; the draft and transcript carry over.
 - Extensions in the side agent run in RPC mode. Their dialogs reach you, and

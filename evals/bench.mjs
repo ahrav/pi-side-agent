@@ -8,12 +8,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { tmpdir } from "node:os";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { JsonlReader, wantsRecord } from "../extensions/side-agent/jsonl.ts";
+import { SideAgentController } from "../extensions/side-agent/controller.ts";
+import { defaultConfig } from "../extensions/side-agent/layout.ts";
 import { launchArgs, SideProcess } from "../extensions/side-agent/process.ts";
 import { SIDE_AGENT_PROMPT } from "../extensions/side-agent/protocol.ts";
 import { Transcript } from "../extensions/side-agent/transcript.ts";
 import { SideWindow } from "../extensions/side-agent/view.ts";
-import { bridgePath, editorTheme, fakeTui, keys, markdownTheme, scriptedPi, theme } from "../tests/support/fakes.mjs";
+import { bridgePath, editorTheme, fakeContext, fakePi, fakeTui, KEY, keys, markdownTheme, scriptedPi, theme } from "../tests/support/fakes.mjs";
 
 const ms = (value) => `${value.toFixed(value < 10 ? 2 : 1)} ms`;
 const mb = (bytes) => `${(bytes / 1024 / 1024).toFixed(2)} MB`;
@@ -51,7 +54,7 @@ function window(transcript, { rowCount = 54, columns = 200, activity } = {}) {
     since = label ? since || performance.now() : 0;
     return label ? { label, since } : undefined;
   };
-  const side = new SideWindow({ tui, theme, keys, markdownTheme, editorTheme, transcript, cwd: process.cwd(), toggleKey: "alt+a", rows: () => rowCount, busy: () => transcript.busy, activity: activity ?? running, outbox: () => [], title: () => "side agent · provider/model", state: () => "working…", note: () => "", actions });
+  const side = new SideWindow({ tui, theme, keys, markdownTheme, editorTheme, transcript, cwd: process.cwd(), toggleKey: "alt+a", rows: () => rowCount, stoppable: () => transcript.busy, activity: activity ?? running, outbox: () => [], title: () => "side agent · provider/model", state: () => "working…", note: () => "", actions });
   side.focused = true;
   return { side, tui };
 }
@@ -164,11 +167,11 @@ function benchRender() {
     const waiting = window(transcript, { activity: () => ({ label: "Thinking…", since }) }).side;
     waiting.render(184);
     const spinner = timed(() => {
-      since -= 100;
+      since -= 250;
       waiting.render(184);
     }, 201);
     waiting.dispose();
-    report("render", `${blocks} blocks: frame that advances the activity spinner`, `${(spinner * 1000).toFixed(1)} µs, ten a second = ${spinner.toFixed(2)}% of one core`);
+    report("render", `${blocks} blocks: frame that advances the activity spinner`, `${(spinner * 1000).toFixed(1)} µs, four a second = ${(spinner * 0.4).toFixed(2)}% of one core`);
   }
   for (const chars of [2000, 20_000, 80_000]) {
     const transcript = new Transcript();
@@ -245,6 +248,35 @@ async function liveRun({ draw, monitor, chars = 0, paceMs = 0, script }) {
   return result;
 }
 
+// The side window's controller runs the same scripted stream after escape closes its window. The run ends at
+// the completion notice the controller sends to the main UI.
+async function hiddenRun({ chars, paceMs }) {
+  initTheme();
+  const home = fs.mkdtempSync(path.join(tmpdir(), "side-bench-"));
+  const script = [{ text: markdown(chars * 0.8), paceMs, tools: [{ name: "bash", arguments: { command: 'for i in $(seq 1 400); do echo "output line $i of the tool"; done' } }] }, { text: markdown(chars * 0.2), paceMs }];
+  const scripted = scriptedPi(home, script);
+  const ctx = fakeContext({ cwd: home });
+  const controller = new SideAgentController({ pi: fakePi(), config: defaultConfig(), configPath: path.join(home, "side-agent.json"), sessionDir: path.join(home, "sessions"), bridgePath, invocation: scripted.invocation, extraArgs: scripted.extraArgs, env: scripted.env });
+  controller.open(ctx);
+  await controller.whenReady();
+  ctx.overlays[0].component.handleInput(KEY.escape);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const finished = new Promise((resolve) => (ctx.ui.notify = resolve));
+  const renders = ctx.tui.renders;
+  const cpu = process.cpuUsage();
+  const started = performance.now();
+  controller.submit("go", "steer");
+  await finished;
+  const elapsed = performance.now() - started;
+  const used = process.cpuUsage(cpu);
+  const result = { elapsed, cpuMs: (used.user + used.system) / 1000, statusWrites: ctx.statusWrites, renders: ctx.tui.renders - renders };
+  const exited = new Promise((resolve) => spawn("sh", ["-c", `while kill -0 ${controller.pid} 2>/dev/null; do sleep 0.05; done`]).on("exit", resolve));
+  controller.shutdown();
+  await exited;
+  fs.rmSync(home, { recursive: true, force: true });
+  return result;
+}
+
 async function benchLive() {
   const share = (run) => `${ms(run.cpuMs)} = ${((run.cpuMs / run.elapsed) * 100).toFixed(1)}% of one core`;
   const nanos = (value) => ms(value / 1e6);
@@ -259,6 +291,8 @@ async function benchLive() {
     report("live", `${label}: host CPU, window closed`, share(closed));
     report("live", `${label}: host CPU, window open`, `${share(open)}; ${open.frames} frames drawn in ${ms(open.renderMs)}`);
     report("live", `${label}: event-loop delay p50 / p99 / max`, `${nanos(sampled.delay.percentile(50))} / ${nanos(sampled.delay.percentile(99))} / ${nanos(sampled.delay.max)}`);
+    const hidden = await hiddenRun({ chars, paceMs });
+    report("live", `${label}: host CPU of the controller after escape closes the window`, `${share(hidden)}; ${hidden.statusWrites} footer status writes, ${hidden.renders} frames requested`);
   }
   const wait = [{ delayMs: 6000, text: "done" }];
   const quiet = await liveRun({ draw: false, monitor: false, script: wait });

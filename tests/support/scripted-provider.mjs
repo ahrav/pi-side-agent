@@ -4,6 +4,8 @@
 // response and `paceMs` spaces its text deltas. Requests past the last step
 // answer "DONE". Every request is appended to SIDE_REQUEST_LOG when that variable is set.
 // The tool `ask_confirm` opens a confirm dialog and returns the answer.
+// A prompt that contains `[slow input]` waits 300 ms in an input handler before pi accepts it.
+// A prompt that contains `[slow start]` waits 300 ms in an agent_start handler before its run reports its start.
 import * as fs from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -18,6 +20,14 @@ function chunks(text, size = 5) {
 
 export default function (pi) {
   const steps = JSON.parse(process.env.SIDE_SCRIPT ?? "[]");
+  let slowStart = false;
+  pi.on("input", async (event) => {
+    slowStart = event.text.includes("[slow start]");
+    if (event.text.includes("[slow input]")) await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+  pi.on("agent_start", async () => {
+    if (slowStart) await new Promise((resolve) => setTimeout(resolve, 300));
+  });
   pi.registerTool({
     name: "ask_confirm",
     label: "Ask confirm",

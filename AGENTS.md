@@ -28,8 +28,10 @@ cost. `evals/run.mjs` grades live-model runs.
   handling in `controller.ts`, run `npm run bench` and compare with the table
   in `README.md`. Update the table when a number moves.
 - After a change to `child.ts`, `main-bridge.ts`, or the prompt in
-  `protocol.ts`, run `npm run eval` with a small model. It costs tokens; say
-  so before running it for someone else.
+  `protocol.ts`, run `npm run eval` with a small model. After a change to the
+  window's keys or to the stop, close, and report paths in `controller.ts`,
+  run `npm run eval -- --only window`. It costs tokens; say so before running
+  it for someone else.
 - Never append a comment-lint `allow(...)` override marker. Rewrite or delete
   the comment instead. `.githooks/pre-commit` checks staged additions with
   `scripts/forbid-comment-markers.sh --staged`. Enable it with
@@ -54,6 +56,12 @@ Tests fail when one of these breaks. Keep them when you change the code.
 - Only a draw of an active window sets the spinner timer, one at a time. The
   animation stops when pi stops drawing the window, and an idle or disposed
   window requests no frame.
+- Escape closes the window and sends the side agent nothing. Only ctrl+c on an
+  empty composer stops the side agent's work, and it sends `clear_queue`
+  before `abort` so queued messages return to the composer.
+- The footer status is set only while the window is closed, and is written
+  only when its text changes. A run stopped with ctrl+c produces no completion
+  notice.
 - A callback from the side process stream or IPC channel never throws into
   the host.
 - The side agent process exits when the host stops it and when the host dies.

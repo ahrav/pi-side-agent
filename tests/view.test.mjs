@@ -5,14 +5,14 @@ import { Transcript } from "../extensions/side-agent/transcript.ts";
 import { SideWindow } from "../extensions/side-agent/view.ts";
 import { editorTheme, fakeTui, KEY, keys, markdownTheme, theme, until } from "./support/fakes.mjs";
 
-const ACTIONS = ["submit", "abort", "close", "unfocus", "resize", "toggleMaximize", "cycleModel", "cycleThinking", "pickModel"];
+const ACTIONS = ["submit", "stop", "close", "unfocus", "resize", "toggleMaximize", "cycleModel", "cycleThinking", "pickModel"];
 
 /** A focused window over an empty transcript. `calls` records the actions the window invokes. */
 function build({ rows = 30, markdown = markdownTheme, actions = {} } = {}) {
   const tui = fakeTui(rows, 120);
   const transcript = new Transcript();
   const calls = [];
-  const shown = { rows, title: "side agent · p/m", state: "idle", note: "", activity: undefined, outbox: [] };
+  const shown = { rows, title: "side agent · p/m", state: "idle", note: "", activity: undefined, outbox: [], stoppable: undefined };
   const window = new SideWindow({
     tui,
     theme,
@@ -23,7 +23,7 @@ function build({ rows = 30, markdown = markdownTheme, actions = {} } = {}) {
     cwd: process.cwd(),
     toggleKey: "alt+a",
     rows: () => shown.rows,
-    busy: () => transcript.busy,
+    stoppable: () => shown.stoppable ?? transcript.busy,
     activity: () => shown.activity,
     outbox: () => shown.outbox,
     title: () => shown.title,
@@ -181,20 +181,24 @@ test("the title, state, note, and key hints frame the transcript", () => {
   shown.note = "Only one model is available to cycle.";
   let lines = window.render(100);
   assert.match(lines[0], /^╭─ side agent · p\/m ─+ idle ─╮$/);
-  assert.match(lines.at(-2), /Only one model is available to cycle\..*alt\+a main · esc close/);
+  assert.match(lines.at(-2), /Only one model is available to cycle\..*alt\+a main · esc hide · pgup\/pgdn scroll/);
   assert.match(lines.at(-1), /^╰─+╯$/);
   assert.match(lines.at(-5), /^├─+┤$/, "the composer joins the frame");
   transcript.apply({ type: "agent_start" });
   shown.state = "working…";
   lines = window.render(100);
   assert.match(lines[0], /working… ─╮$/);
-  assert.match(lines.at(-2), /esc stop/);
+  assert.match(lines.at(-2), /alt\+a main · esc hide · ctrl\+c stop · pgup\/pgdn scroll/);
+  type(window, "a draft");
+  assert.doesNotMatch(body(window.render(100)), /ctrl\+c stop/, "with a draft, ctrl+c clears the draft, so the stop hints are absent");
+  window.handleInput(KEY.ctrlC);
+  assert.match(window.render(100).at(-2), /ctrl\+c stop/);
   shown.title = "side agent · " + "very-long-model-name/".repeat(10);
   assert.equal(visibleWidth(window.render(60)[0]), 60, "a long title is cut to the frame");
 });
 
 test("keys reach the window's actions", () => {
-  const { window, transcript, calls } = build();
+  const { window, transcript, calls, shown } = build();
   window.render(100);
   for (const key of [KEY.altM, KEY.altPlus, KEY.altMinus, KEY.ctrlL, KEY.ctrlP, KEY.shiftTab, KEY.altA]) window.handleInput(key);
   assert.deepEqual(calls.splice(0), [["toggleMaximize"], ["resize", 1], ["resize", -1], ["pickModel"], ["cycleModel"], ["cycleThinking"], ["unfocus"]]);
@@ -202,13 +206,17 @@ test("keys reach the window's actions", () => {
   window.handleInput(KEY.escape);
   transcript.apply({ type: "agent_start" });
   window.handleInput(KEY.escape);
-  assert.deepEqual(calls.splice(0), [["close"], ["abort"]], "escape closes an idle window and stops a running turn");
+  assert.deepEqual(calls.splice(0), [["close"], ["close"]], "escape closes the window and leaves a running turn alone");
 
   type(window, "draft");
   window.handleInput(KEY.ctrlC);
   assert.equal(window.editor.getText(), "", "ctrl+c clears a draft first");
+  assert.deepEqual(calls.splice(0), []);
   window.handleInput(KEY.ctrlC);
-  assert.deepEqual(calls.splice(0), [["close"]]);
+  assert.deepEqual(calls.splice(0), [["stop"]], "ctrl+c on an empty composer stops a running turn");
+  shown.stoppable = false;
+  window.handleInput(KEY.ctrlC);
+  assert.deepEqual(calls.splice(0), [["close"]], "ctrl+c closes the window when nothing is left to stop");
 });
 
 test("enter sends the draft and alt+enter queues it as a follow-up", () => {
@@ -323,7 +331,7 @@ test("an action that throws is reported in the window instead of thrown at pi", 
   assert.doesNotMatch(window.render(100).at(-2), /maximize failed/, "the next key clears the report");
 });
 
-const SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+const SPINNER = /[⠋⠙⠸⠴⠦⠇]/;
 const activityLine = (lines) => lines[lines.findIndex((line) => line.startsWith("├")) - 1];
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -338,15 +346,15 @@ test("an active side agent shows a spinner, its step, and the elapsed time above
   shown.activity = { label: "Thinking…", since: performance.now() - 2350 };
   const active = window.render(100);
   assert.equal(active.length, 30, "the activity line takes a transcript row, and the frame keeps its height");
-  assert.match(activityLine(active), new RegExp(`^│ ${SPINNER.source} Thinking… 2s · esc stops +│$`));
+  assert.match(activityLine(active), new RegExp(`^│ ${SPINNER.source} Thinking… 2s · ctrl\\+c stops +│$`));
   assert.match(body(active), /answer 2/, "the end of the transcript stays in view");
 
   shown.activity = { label: "Running bash…", since: performance.now() - 65_400 };
-  assert.match(activityLine(window.render(100)), /Running bash… 1m 05s · esc stops/);
+  assert.match(activityLine(window.render(100)), /Running bash… 1m 05s · ctrl\+c stops/);
 
   transcript.apply({ type: "agent_settled" });
   shown.activity = { label: "Starting the side agent…", since: performance.now() - 400 };
-  assert.match(activityLine(window.render(100)), /Starting the side agent… 0s +│$/, "escape stops nothing while the side agent starts");
+  assert.match(activityLine(window.render(100)), /Starting the side agent… 0s +│$/, "the stop hint shows only while there is work to stop");
 
   for (const [width, rows] of [[44, 10], [31, 9], [200, 60]]) {
     shown.rows = rows;
@@ -371,14 +379,29 @@ test("the spinner advances while pi draws the window and requests no frame other
 
   tui.renders = 0;
   await until(() => tui.renders >= 1, { label: "the frame request scheduled by the last draw" });
-  await pause(350);
+  await pause(400);
   assert.equal(tui.renders, 1, "a window that pi no longer draws requests one frame and stops");
 
   window.render(100);
   window.dispose();
   tui.renders = 0;
-  await pause(250);
+  await pause(400);
   assert.equal(tui.renders, 0, "a disposed window requests no frame");
+});
+
+test("a working window that pi keeps drawing requests four spinner frames a second", async () => {
+  const { window, tui, shown } = build();
+  shown.activity = { label: "Thinking", since: performance.now() };
+  let drawing = true;
+  tui.requestRender = () => {
+    tui.renders += 1;
+    setImmediate(() => drawing && window.render(100));
+  };
+  window.render(100);
+  await pause(1100);
+  drawing = false;
+  window.dispose();
+  assert.ok(tui.renders >= 3 && tui.renders <= 5, `${tui.renders} frame requests in 1.1 s`);
 });
 
 test("a message held for the side agent shows as sent, above the queued messages", () => {

@@ -45,13 +45,14 @@ export const LOCAL_COMMANDS: SlashCommand[] = [
 const HELP = [
   "Side window commands: /model [search] · /thinking [level] · /new · /size <w%> [h%] | full · /dock <place> · /send [note] · /copy · /compact · /quit.",
   "Any other /command runs in the side agent, including skills and prompt templates.",
-  "Keys: enter sends · alt+enter queues a follow-up · esc stops a running turn, then closes · pgup/pgdn scroll · ctrl+end follows output.",
+  "Keys: enter sends · alt+enter queues a follow-up · esc hides the window while the side agent keeps working · ctrl+c stops a running turn, then closes the window · pgup/pgdn scroll · ctrl+end follows output.",
   "Model: the model-select key opens the picker · the model-cycle key cycles · the thinking-cycle key cycles thinking. Tool output: the tool-expand key.",
   "Window: alt+m maximizes or restores · alt+= and alt+- resize.",
 ].join("\n");
 
 const SAVE_DELAY_MS = 300;
 const STDERR_NOTICE_CHARS = 600;
+const STATUS_KEY = "side-agent";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -71,8 +72,15 @@ export class SideAgentController {
   private waiting: Array<{ text: string; behavior: "steer" | "followUp" }> = [];
   private outbox: string[] = [];
   /** A pending prompt RPC keeps the side agent's status at `working…` even when the transcript is idle. */
-  private unanswered = 0;
+  private readonly sending = new Set<Promise<void>>();
+  /** When a prompt RPC returns `started` with `runs` unchanged, `launching` keeps the side agent working until the next `agent_start` or `agent_settled` record. */
+  private launching = false;
+  private runs = 0;
+  private halting = false;
   private activeSince = 0;
+  /** `unseen` records the last outcome reported to the main UI while the side window lacked focus. */
+  private unseen: "" | "done" | "failed" = "";
+  private status: string | undefined;
   private dialogs: Promise<void> = Promise.resolve();
   private model: ModelRef | undefined;
   private thinking: string | undefined;
@@ -99,8 +107,11 @@ export class SideAgentController {
     });
     this.actions = {
       submit: (text, behavior) => this.submit(text, behavior),
-      abort: () => this.run(this.rpc({ type: "abort" })),
-      close: () => this.close(),
+      stop: () => this.stop(),
+      close: () => {
+        this.close();
+        this.syncStatus();
+      },
       unfocus: () => this.overlay?.handle?.unfocus(),
       resize: (step) => this.setLayout(resizeLayout(this.config.window, step * RESIZE_STEP)),
       toggleMaximize: () => this.toggleMaximize(),
@@ -145,6 +156,8 @@ export class SideAgentController {
     this.close();
     this.process?.stop();
     this.bridge.detach();
+    if (this.status !== undefined && this.ctx?.hasUI) this.ctx.ui.setStatus(STATUS_KEY, undefined);
+    this.status = undefined;
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       void writeConfig(this.options.configPath, this.config).catch(() => {});
@@ -257,15 +270,32 @@ export class SideAgentController {
     }
     if (record.type === "thinking_level_changed" && typeof record.level === "string") this.thinking = record.level;
     if (this.outbox.length > 0) this.settleOutbox(record);
+    if (record.type === "agent_start") this.runs += 1;
+    if (record.type === "agent_start" || record.type === "agent_settled") this.launching = false;
     const version = this.transcript.version;
+    const active = this.transcript.active;
     this.transcript.apply(record);
     this.stamp();
     if (record.type === "agent_settled") {
       this.run(this.refreshUsage(process));
-      if (this.overlay?.handle?.isFocused() !== true && this.ctx?.hasUI) this.ctx.ui.notify(`Side agent finished. ${this.config.toggleKey} opens it.`, "info");
+      if (record.aborted !== true) this.report(this.lastNoticeIsError() ? "failed" : "done");
       this.refresh();
-    } else if (record.type === "agent_start" || record.type === "thinking_level_changed") this.refresh();
+    } else if (record.type === "agent_start" || record.type === "thinking_level_changed" || this.transcript.active !== active) this.refresh();
     else if (this.transcript.version !== version) this.overlay?.window?.contentChanged();
+  }
+
+  private lastNoticeIsError(): boolean {
+    const last = this.transcript.blocks.at(-1);
+    return last?.kind === "notice" && last.level === "error";
+  }
+
+  private report(outcome: "done" | "failed", message?: string): void {
+    const ctx = this.ctx;
+    if (this.overlay?.handle?.isFocused() === true || !ctx?.hasUI) return;
+    this.unseen = outcome;
+    const opens = `${this.config.toggleKey} opens it.`;
+    if (outcome === "done") ctx.ui.notify(`Side agent finished. ${opens}`, "info");
+    else ctx.ui.notify(`${message ?? "Side agent stopped on an error."} ${opens}`, "error");
   }
 
   private settleOutbox(record: Json): void {
@@ -282,12 +312,14 @@ export class SideAgentController {
     this.phase = "stopped";
     this.waiting = [];
     this.outbox = [];
+    this.launching = false;
     this.bridge.detach();
     this.transcript.apply({ type: "agent_settled" });
     if (!this.stopping) {
       const reason = exit.signal ? `signal ${exit.signal}` : `code ${exit.code}`;
       const detail = exit.stderr.trim().slice(-STDERR_NOTICE_CHARS);
       this.transcript.notice("error", `The side agent process exited (${reason}).${detail ? `\n${detail}` : ""}\nSend a message to restart it.`);
+      this.report("failed", "The side agent process exited.");
     }
     this.refresh();
   }
@@ -336,18 +368,55 @@ export class SideAgentController {
   }
 
   private prompt(text: string, behavior: "steer" | "followUp"): void {
-    this.unanswered += 1;
+    const { runs } = this;
+    const sent: Promise<void> = this.rpc({ type: "prompt", message: text, streamingBehavior: behavior })
+      .then((accepted) => {
+        if (!accepted) this.outbox = [];
+        else if (accepted.disposition === "started" && this.runs === runs) this.launching = true;
+      })
+      .finally(() => {
+        this.sending.delete(sent);
+        this.refresh();
+      });
+    this.sending.add(sent);
+    this.refresh();
+    this.run(sent);
+  }
+
+  private stop(): void {
+    this.halting = true;
     this.refresh();
     this.run(
-      this.rpc({ type: "prompt", message: text, streamingBehavior: behavior })
-        .then((accepted) => {
-          if (!accepted) this.outbox = [];
-        })
-        .finally(() => {
-          this.unanswered -= 1;
-          this.refresh();
-        }),
+      this.halt().finally(() => {
+        this.halting = false;
+        this.refresh();
+      }),
     );
+  }
+
+  private async halt(): Promise<void> {
+    this.outbox = [];
+    if (this.phase !== "ready") {
+      this.restoreDraft(this.waiting.splice(0).map((entry) => entry.text));
+      return;
+    }
+    const starting = [...this.sending];
+    const queue = await this.rpc({ type: "clear_queue" });
+    this.restoreDraft([...(queue?.steering ?? []), ...(queue?.followUp ?? [])]);
+    await this.rpc({ type: "abort" });
+    if (starting.length === 0) return;
+    // The second abort covers a prompt whose run starts after the first abort.
+    await Promise.all(starting);
+    await this.rpc({ type: "abort" });
+  }
+
+  private restoreDraft(texts: string[]): void {
+    if (texts.length === 0) return;
+    const editor = this.overlay?.window?.editor;
+    const combined = [...texts, editor ? editor.getText() : this.draft].filter((text) => text.trim()).join("\n\n");
+    if (editor) editor.setText(combined);
+    else this.draft = combined;
+    this.refresh();
   }
 
   private run(task: Promise<unknown>): void {
@@ -357,8 +426,8 @@ export class SideAgentController {
     });
   }
 
-  private busy(): boolean {
-    return this.transcript.busy || this.unanswered > 0 || this.waiting.length > 0;
+  private working(): boolean {
+    return this.transcript.active || this.launching || this.sending.size > 0 || this.waiting.length > 0;
   }
 
   private async rpc(command: Json): Promise<Json | undefined> {
@@ -580,25 +649,46 @@ export class SideAgentController {
   }
 
   private stateText(): string {
-    let state = this.busy() || this.transcript.active ? "working…" : "idle";
+    let state = this.working() ? "working…" : "idle";
     if (this.phase === "starting") state = this.waiting.length > 0 ? `starting… ${this.waiting.length} queued` : "starting…";
     else if (this.phase === "stopped") state = "stopped";
     return this.usage ? `${state} · ${this.usage}` : state;
   }
 
   private activity(): Activity | undefined {
-    const label = this.phase === "starting" ? "Starting the side agent…" : this.transcript.activity() || (this.unanswered > 0 ? "Sending…" : "");
+    let label = this.phase === "starting" ? "Starting the side agent…" : this.transcript.activity() || (this.sending.size > 0 || this.launching ? "Sending…" : "");
+    if (label && this.halting) label = "Stopping…";
     return label ? { label, since: this.activeSince || performance.now() } : undefined;
+  }
+
+  private stoppable(): boolean {
+    return !this.halting && this.working();
+  }
+
+  private syncStatus(): void {
+    const ctx = this.ctx;
+    if (!ctx?.hasUI) return;
+    let text: string | undefined;
+    if (!this.overlay) {
+      const { theme } = ctx.ui;
+      if (this.working()) text = theme.fg("accent", "side agent working…");
+      else if (this.unseen === "done") text = theme.fg("success", "side agent done");
+      else if (this.unseen === "failed") text = theme.fg("error", "side agent failed");
+    }
+    if (text === this.status) return;
+    this.status = text;
+    ctx.ui.setStatus(STATUS_KEY, text);
   }
 
   /** `activeSince` holds the time the side agent last went from idle to active, and 0 while it is idle. */
   private stamp(): void {
-    if (this.phase !== "starting" && this.unanswered === 0 && !this.transcript.active) this.activeSince = 0;
+    if (this.phase !== "starting" && !this.working()) this.activeSince = 0;
     else if (this.activeSince === 0) this.activeSince = performance.now();
   }
 
   private refresh(): void {
     this.stamp();
+    this.syncStatus();
     this.overlay?.window?.touch();
   }
 
@@ -614,6 +704,7 @@ export class SideAgentController {
     const overlay = this.overlay;
     if (!overlay) return;
     this.overlay = undefined;
+    this.unseen = "";
     overlay.closed = true;
     if (overlay.window) this.draft = overlay.window.editor.getText();
     overlay.done?.();
@@ -626,6 +717,7 @@ export class SideAgentController {
     }
     const overlay: OverlayState = {};
     this.overlay = overlay;
+    this.syncStatus();
     ctx.ui
       .custom<void>(
         (tui, theme, keybindings, done) => {
@@ -640,7 +732,7 @@ export class SideAgentController {
             cwd: ctx.cwd,
             toggleKey: this.config.toggleKey,
             rows: () => windowRows(tui.terminal.rows, this.config.window),
-            busy: () => this.busy(),
+            stoppable: () => this.stoppable(),
             activity: () => this.activity(),
             outbox: () => this.outbox,
             title: () => this.title(),

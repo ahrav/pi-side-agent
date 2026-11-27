@@ -6,12 +6,12 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { SideAgentController } from "../extensions/side-agent/controller.ts";
 import { defaultConfig, readConfig } from "../extensions/side-agent/layout.ts";
 import { MAIN_MESSAGE_TYPE, SESSION_ENTRY_TYPE } from "../extensions/side-agent/protocol.ts";
-import { alive, bridgePath, fakeContext, fakePi, KEY, scriptedPi, tempDir, until } from "./support/fakes.mjs";
+import { alive, bridgePath, fakeContext, fakePi, KEY, root, scriptedPi, tempDir, until } from "./support/fakes.mjs";
 
 initTheme();
 
 const WIDTH = 110;
-const SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+const SPINNER = /[⠋⠙⠸⠴⠦⠇]/;
 
 /**
  * A controller over a fake pi and interactive context, whose side agent is the repository's pi with
@@ -58,7 +58,7 @@ test("opening the window starts the side agent and answers a prompt typed before
   assert.equal(overlay().focused, true);
   assert.deepEqual(overlay().options.overlayOptions, { anchor: "center", width: "92%", minWidth: 40, maxHeight: "100%", margin: 0, nonCapturing: true });
   assert.match(screen(), /starting… 1 queued/);
-  assert.match(screen(), new RegExp(`❯ say hello[\\s\\S]*${SPINNER.source} Starting the side agent… 0s · esc stops +│\\n├`), "the held message and the starting line show at once");
+  assert.match(screen(), new RegExp(`❯ say hello[\\s\\S]*${SPINNER.source} Starting the side agent… 0s · ctrl\\+c stops +│\\n├`), "the held message and the starting line show at once");
 
   await shows(/Hello from the side\./);
   await shows(/ idle[^\n]*─╮/);
@@ -73,38 +73,163 @@ test("opening the window starts the side agent and answers a prompt typed before
   assert.equal(ctx.notes.length, 0, "a focused window needs no completion notice");
 });
 
-test("the window closes, reopens with its transcript and draft, and reports a run that ends while it is away", { timeout: 60_000 }, async (t) => {
-  const { ctx, controller, overlay, enter, type, screen, shows } = setup(t, [{ text: "first answer" }, { delayMs: 300, text: "second answer" }, { delayMs: 150, text: "third answer" }]);
+const STATUS = "side-agent";
+const IDLE = / idle[^\n]*─╮/;
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("escape closes the window while the side agent works, and the main UI follows the run", { timeout: 60_000 }, async (t) => {
+  const script = [{ text: "first answer" }, { delayMs: 300, tools: [{ name: "bash", arguments: { command: "sleep 0.4" } }] }, { delayMs: 300, text: "second answer" }, { delayMs: 150, text: "third answer" }];
+  const { ctx, controller, overlay, enter, type, screen, shows, scripted } = setup(t, script);
   controller.open(ctx);
   await controller.whenReady();
   enter("one");
   await shows(/first answer/);
+  assert.equal(ctx.statusWrites, 0, "an open window writes no footer status");
 
   enter("two");
   assert.match(screen(), /working…/, "a sent prompt counts as work before the run starts");
   await until(() => controller.transcript.busy, { label: "the second run to start" });
   type("a draft");
   overlay().component.handleInput(KEY.escape);
-  assert.equal(ctx.overlays.length, 1, "escape during a run stops the run and keeps the window");
-  await shows(/Aborted\./);
-  overlay().component.handleInput(KEY.escape);
-  assert.equal(ctx.overlays.length, 0, "escape on an idle window closes it");
-  assert.equal(controller.running, true, "the side agent keeps running");
+  assert.equal(ctx.overlays.length, 0, "escape closes the window during a run");
+  assert.equal(ctx.statuses.get(STATUS), "side agent working…");
+  assert.equal(ctx.notes.length, 0);
+
+  await until(() => ctx.notes.length > 0, { label: "the completion notice" });
+  assert.deepEqual(ctx.notes, [["info", "Side agent finished. alt+a opens it."]]);
+  assert.equal(ctx.statuses.get(STATUS), "side agent done");
+  assert.equal(scripted.requests().length, 3, "the run made its tool call and its next model request with the window closed");
+  assert.equal(ctx.statusWrites, 2, "the footer status is written once per change");
 
   controller.toggle(ctx);
   assert.equal(ctx.overlays.length, 1);
-  assert.match(screen(), /first answer[\s\S]*Aborted\.[\s\S]*a draft/);
+  assert.equal(ctx.statuses.size, 0, "the open window clears the footer status");
+  assert.match(screen(), /first answer[\s\S]*✓ bash[\s\S]*second answer[\s\S]*a draft/);
+  assert.doesNotMatch(screen(), /Aborted/);
 
+  overlay().component.handleInput(KEY.escape);
+  assert.equal(ctx.overlays.length, 0, "escape closes an idle window");
+  assert.equal(ctx.statuses.size, 0, "a result the window has shown leaves no footer status");
+  assert.equal(controller.running, true, "the side agent keeps running");
+
+  controller.toggle(ctx);
   overlay().component.handleInput(KEY.ctrlC);
+  assert.equal(overlay().component.editor.getText(), "", "ctrl+c clears the draft");
   enter("three");
   overlay().component.handleInput(KEY.altA);
   assert.equal(overlay().focused, false, "the toggle key returns focus to the main editor");
-  await until(() => ctx.notes.length > 0, { label: "the completion notice" });
+  await until(() => ctx.notes.length > 1, { label: "the second completion notice" });
   assert.deepEqual(ctx.notes.at(-1), ["info", "Side agent finished. alt+a opens it."]);
+  assert.equal(ctx.statuses.size, 0, "a visible window needs no footer status");
   controller.toggle(ctx);
   assert.equal(overlay().focused, true);
   assert.match(screen(), /third answer/);
-  assert.doesNotMatch(screen(), /second answer/, "the aborted run produced no answer");
+});
+
+test("ctrl+c stops the run, returns queued messages to the composer, and then closes the window", { timeout: 60_000 }, async (t) => {
+  const { ctx, controller, overlay, enter, type, screen, shows, scripted } = setup(t, [{ delayMs: 20_000, text: "never shown" }, { text: "after the stop" }]);
+  const window = () => overlay().component;
+  controller.open(ctx);
+  await controller.whenReady();
+  enter("first");
+  await until(() => controller.transcript.busy, { label: "the run to start" });
+  enter("steer it");
+  type("then follow up");
+  window().handleInput(KEY.altEnter);
+  await shows(/⏳ queued: steer it[\s\S]*⏳ queued: then follow up/);
+  assert.match(screen(), /esc hide · ctrl\+c stop · /);
+
+  window().handleInput(KEY.ctrlC);
+  assert.match(screen(), new RegExp(`${SPINNER.source} Stopping… \\ds +│\\n├`), "the activity line names the stop without the stop hint");
+  await shows(/Aborted\./);
+  await shows(IDLE);
+  assert.equal(ctx.overlays.length, 1, "the window stays open after a stop");
+  assert.equal(window().editor.getText(), "steer it\n\nthen follow up");
+  assert.doesNotMatch(screen(), /queued:/);
+  assert.doesNotMatch(screen(), /ctrl\+c stop/);
+  await pause(400);
+  assert.equal(controller.transcript.busy, false, "the returned messages start no run");
+  assert.equal(scripted.requests().length, 1);
+  assert.equal(ctx.notes.length, 0);
+
+  window().handleInput(KEY.ctrlC);
+  assert.equal(window().editor.getText(), "");
+  assert.equal(ctx.overlays.length, 1);
+  window().handleInput(KEY.ctrlC);
+  assert.equal(ctx.overlays.length, 0, "ctrl+c closes an idle window with an empty composer");
+  assert.equal(ctx.statuses.size, 0);
+
+  controller.toggle(ctx);
+  enter("next");
+  await shows(/after the stop/);
+});
+
+test("ctrl+c twice stops a running tool and closes the window, and the stopped run sends no completion notice", { timeout: 60_000 }, async (t) => {
+  const { ctx, controller, overlay, enter, notices, scripted } = setup(t, [{ tools: [{ name: "bash", arguments: { command: "sleep 30" } }] }, { text: "never shown" }]);
+  controller.open(ctx);
+  await controller.whenReady();
+  enter("go");
+  await until(() => controller.transcript.activity() === "Running bash…", { label: "the tool to start" });
+  overlay().component.handleInput(KEY.ctrlC);
+  overlay().component.handleInput(KEY.ctrlC);
+  assert.equal(ctx.overlays.length, 0, "the second ctrl+c closes the window while the stop is in progress");
+  await until(() => !controller.transcript.busy, { label: "the run to stop", timeoutMs: 5000 });
+  await until(() => ctx.statuses.size === 0, { label: "the footer status to clear" });
+  assert.deepEqual(notices(), ["Aborted."]);
+  assert.deepEqual(controller.transcript.blocks.filter((block) => block.kind === "tool").map((block) => [block.name, block.status]), [["bash", "error"]]);
+  assert.equal(ctx.notes.length, 0, "a stopped run is not reported as finished");
+  assert.equal(scripted.requests().length, 1);
+  assert.equal(controller.running, true, "the side session stays available");
+});
+
+test("ctrl+c stops a run whose prompt pi has not accepted yet, and returns a message held for startup", { timeout: 60_000 }, async (t) => {
+  const early = setup(t, [{ delayMs: 20_000, text: "never shown" }]);
+  early.controller.open(early.ctx);
+  await early.controller.whenReady();
+  early.enter("[slow input] go");
+  early.overlay().component.handleInput(KEY.ctrlC);
+  assert.equal(early.ctx.overlays.length, 1, "a sent prompt counts as work to stop");
+  await until(() => early.controller.transcript.blocks.some((block) => block.kind === "user"), { label: "pi to accept the prompt" });
+  await early.shows(IDLE);
+  await pause(400);
+  assert.equal(early.controller.transcript.busy, false);
+  assert.doesNotMatch(early.screen(), /never shown/);
+  assert.doesNotMatch(early.screen(), SPINNER);
+
+  const held = setup(t, [{ text: "unused" }]);
+  held.controller.open(held.ctx, "a held message");
+  assert.match(held.screen(), /❯ a held message/);
+  held.overlay().component.handleInput(KEY.ctrlC);
+  assert.equal(held.overlay().component.editor.getText(), "a held message");
+  assert.doesNotMatch(held.screen(), /❯ a held message/);
+  await held.controller.whenReady();
+  await held.shows(IDLE);
+  await pause(300);
+  assert.equal(fs.existsSync(path.join(held.home, "requests.jsonl")), false, "the returned message reaches no model");
+});
+
+test("a run that fails and a side agent that dies behind a closed window are reported in the main UI", { timeout: 60_000 }, async (t) => {
+  const { ctx, controller, overlay, enter, screen } = setup(t, [{ delayMs: 300, error: "the scripted request failed" }]);
+  controller.open(ctx);
+  await controller.whenReady();
+  enter("fail");
+  await until(() => controller.transcript.busy, { label: "the run to start" });
+  overlay().component.handleInput(KEY.escape);
+  await until(() => ctx.notes.length > 0, { label: "the failure notice" });
+  assert.deepEqual(ctx.notes, [["error", "Side agent stopped on an error. alt+a opens it."]]);
+  assert.equal(ctx.statuses.get(STATUS), "side agent failed");
+
+  controller.toggle(ctx);
+  assert.match(screen(), /the scripted request failed/);
+  assert.equal(ctx.statuses.size, 0);
+  overlay().component.handleInput(KEY.escape);
+  process.kill(controller.pid, "SIGKILL");
+  await until(() => ctx.notes.length > 1, { label: "the exit notice" });
+  assert.deepEqual(ctx.notes.at(-1), ["error", "The side agent process exited. alt+a opens it."]);
+  assert.equal(ctx.statuses.get(STATUS), "side agent failed");
+
+  controller.shutdown();
+  assert.equal(ctx.statuses.size, 0, "shutdown clears the footer status");
 });
 
 test("size, dock, and maximize change the window and persist", { timeout: 60_000 }, async (t) => {
@@ -246,6 +371,20 @@ test("a dialog the side agent opens is asked in the main UI", { timeout: 60_000 
   assert.equal(overlay().focused, true);
 });
 
+test("a dialog the side agent opens behind a closed window is asked in the main UI", { timeout: 60_000 }, async (t) => {
+  const { ctx, controller, enter, scripted, overlay } = setup(t, [{ delayMs: 300, tools: [{ name: "ask_confirm", arguments: { question: "Delete the cache?" } }] }, { text: "ok" }]);
+  ctx.answers.confirm = true;
+  controller.open(ctx);
+  await controller.whenReady();
+  enter("clean up");
+  await until(() => controller.transcript.busy, { label: "the run to start" });
+  overlay().component.handleInput(KEY.escape);
+  await until(() => ctx.notes.length > 0, { label: "the completion notice" });
+  assert.deepEqual(ctx.dialogs, [["confirm", "[side agent] Delete the cache?", "Asked by the scripted tool."]]);
+  assert.equal(scripted.requests().at(-1).messages.find((message) => message.role === "toolResult").content[0].text, "confirmed: true");
+  assert.equal(ctx.overlays.length, 0, "the window stays closed");
+});
+
 test("/new starts a fresh side session and commands the window does not own run in the side agent", { timeout: 60_000 }, async (t) => {
   const { pi, ctx, controller, enter, shows, screen, scripted } = setup(t, [{ text: "old answer" }, { text: "fresh answer" }]);
   controller.open(ctx);
@@ -294,7 +433,7 @@ test("the window names each step of a run, counts its time, and clears the line 
   const answer = "The side agent finished the command and reports its result here.";
   const script = [{ delayMs: 500, tools: [{ name: "bash", arguments: { command: "sleep 0.6" } }] }, { delayMs: 300, text: answer, paceMs: 40 }, { delayMs: 300, text: "second answer" }];
   const { ctx, controller, enter, shows, screen } = setup(t, script);
-  const step = (label) => new RegExp(`${SPINNER.source} ${label} · esc stops +│\\n├`);
+  const step = (label) => new RegExp(`${SPINNER.source} ${label} · ctrl\\+c stops +│\\n├`);
   controller.open(ctx);
   await controller.whenReady();
   assert.doesNotMatch(screen(), SPINNER);
@@ -313,6 +452,42 @@ test("the window names each step of a run, counts its time, and clears the line 
   await shows(/second answer/);
 });
 
+test("the side agent counts as working from the prompt to the end of the run, across a slow run start", { timeout: 60_000 }, async (t) => {
+  const { ctx, controller, overlay, enter, screen, shows } = setup(t, [{ delayMs: 300, text: "first answer" }, { delayMs: 300, text: "second answer" }]);
+  controller.open(ctx);
+  await controller.whenReady();
+  enter("[slow start] go");
+  for (let sample = 0; sample < 45; sample++) {
+    assert.match(screen(), SPINNER, `the activity line shows ${sample * 10} ms after the prompt`);
+    await pause(10);
+  }
+  await shows(/first answer/);
+  await shows(IDLE);
+
+  overlay().component.handleInput(KEY.escape);
+  controller.submit("[slow start] again", "steer");
+  await until(() => ctx.notes.length > 0, { label: "the completion notice" });
+  assert.equal(ctx.statusWrites, 2, "the footer status holds from the prompt to the end of the run");
+  assert.equal(ctx.statuses.get(STATUS), "side agent done");
+});
+
+test("a run that ends in the same read as its prompt's response leaves the side agent idle", { timeout: 30_000 }, async (t) => {
+  const home = tempDir(t);
+  const ctx = fakeContext({ cwd: home });
+  const invocation = () => ({ command: process.execPath, args: [path.join(root, "tests/support/instant-rpc.mjs")] });
+  const controller = new SideAgentController({ pi: fakePi(), config: defaultConfig(), configPath: path.join(home, "side-agent.json"), sessionDir: path.join(home, "sessions"), bridgePath, invocation });
+  t.after(() => controller.shutdown());
+  controller.open(ctx);
+  await controller.whenReady();
+  const window = ctx.overlays[0].component;
+  const screen = () => window.render(WIDTH).join("\n");
+  for (const key of ["g", "o", KEY.enter]) window.handleInput(key);
+  await until(() => /instant answer/.test(screen()), { label: "the answer" });
+  await pause(50);
+  assert.match(screen(), IDLE);
+  assert.doesNotMatch(screen(), SPINNER);
+});
+
 test("a compaction shows on the activity line, and a run after it counts from zero", { timeout: 60_000 }, async (t) => {
   const home = tempDir(t);
   fs.mkdirSync(path.join(home, ".pi/agent"), { recursive: true });
@@ -326,16 +501,25 @@ test("a compaction shows on the activity line, and a run after it counts from ze
   await shows(/ idle[^\n]*─╮/);
 
   enter("/compact");
-  await shows(new RegExp(`${SPINNER.source} Compacting context… 0s +│\\n├`), "the compaction line without the escape hint");
+  await shows(new RegExp(`${SPINNER.source} Compacting context… 0s · ctrl\\+c stops +│\\n├`), "the compaction line");
   assert.match(screen(), / working…[^\n]*─╮/);
-  assert.match(screen(), /esc close/, "escape stops no run during a compaction");
   await shows(new RegExp(`${SPINNER.source} Compacting context… 1s`));
 
-  overlay().component.handleInput(KEY.ctrlC);
+  overlay().component.handleInput(KEY.escape);
   assert.equal(ctx.overlays.length, 0);
+  assert.equal(ctx.statuses.get(STATUS), "side agent working…", "a compaction behind a closed window counts as work");
   await until(() => notices().includes("Context compacted."), { label: "the compaction to end while the window is closed" });
+  await until(() => ctx.statuses.size === 0, { label: "the footer status to clear" });
+  assert.equal(ctx.notes.length, 0, "a compaction ends without a completion notice");
   controller.open(ctx, "again");
   await shows(new RegExp(`${SPINNER.source} (Sending|Waiting for the model)… 0s`), "a run after the compaction counts from zero");
+  await shows(IDLE);
+
+  enter("/compact");
+  await shows(/Compacting context… \ds · ctrl\+c stops/);
+  overlay().component.handleInput(KEY.ctrlC);
+  await until(() => notices().includes("Compaction aborted."), { label: "ctrl+c to stop the compaction" });
+  assert.equal(ctx.overlays.length, 1);
 });
 
 test("a side agent that dies is reported and restarts on the next message", { timeout: 60_000 }, async (t) => {
@@ -376,6 +560,9 @@ test("/quit stops the side agent and closes the window", { timeout: 60_000 }, as
   enter("/quit");
   assert.equal(ctx.overlays.length, 0);
   await until(() => !alive(pid), { label: "the side agent to exit" });
+  await until(() => !controller.running, { label: "the controller to see the exit" });
+  assert.equal(ctx.statuses.size, 0, "a side agent that was quit leaves no footer status");
+  assert.equal(ctx.notes.length, 0);
 });
 
 test("outside interactive mode the command explains itself and starts nothing", (t) => {

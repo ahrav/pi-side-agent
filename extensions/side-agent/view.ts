@@ -45,7 +45,7 @@ export interface PickerItem {
 
 export interface WindowActions {
   submit(text: string, behavior: "steer" | "followUp"): void;
-  abort(): void;
+  stop(): void;
   close(): void;
   unfocus(): void;
   resize(step: number): void;
@@ -71,7 +71,8 @@ export interface WindowDeps {
   cwd: string;
   toggleKey: string;
   rows(): number;
-  busy(): boolean;
+  /** `stoppable()` is true while the side agent has work that `actions.stop` ends. */
+  stoppable(): boolean;
   activity(): Activity | undefined;
   /** The window renders `outbox()` entries as user messages before `transcript.queued` entries. */
   outbox(): readonly string[];
@@ -101,8 +102,8 @@ const TOOL_ERROR_LINES = 4;
 const MIN_FRAME_INTERVAL_MS = 50;
 const MAX_FRAME_INTERVAL_MS = 500;
 const RENDER_COST_FACTOR = 50;
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SPINNER_INTERVAL_MS = 100;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"];
+const SPINNER_INTERVAL_MS = 250;
 const ANSI_STYLE = /\x1b\[[0-9;]*m/g;
 
 function fit(line: string, width: number): string {
@@ -312,7 +313,7 @@ export class SideWindow implements Component, Focusable {
     for (const line of body) lines.push(`${side} ${fit(line, this.contentWidth)} ${side}`);
     if (activity) {
       const spinner = SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
-      const detail = `${elapsed(activeMs)}${deps.busy() ? " · esc stops" : ""}`;
+      const detail = `${elapsed(activeMs)}${this.stops() ? " · ctrl+c stops" : ""}`;
       lines.push(`${side} ${fit(`${theme.fg("accent", `${spinner} ${activity.label}`)} ${theme.fg("dim", detail)}`, this.contentWidth)} ${side}`);
     }
     for (const line of editorLines) {
@@ -360,13 +361,16 @@ export class SideWindow implements Component, Focusable {
     else if (keys.matches(data, "app.tools.expand")) this.style.expandTools = !this.style.expandTools;
     else if (keys.matches(data, "app.thinking.toggle")) this.style.showThinking = !this.style.showThinking;
     else if (keys.matches(data, "app.message.followUp")) this.submitFollowUp();
-    else if (keys.matches(data, "app.interrupt") && !this.editor.isShowingAutocomplete()) {
-      if (this.deps.busy()) actions.abort();
-      else actions.close();
-    } else if (keys.matches(data, "app.clear") && !this.editor.isShowingAutocomplete()) {
-      if (this.editor.getText()) this.editor.setText("");
+    else if (keys.matches(data, "app.interrupt") && !this.editor.isShowingAutocomplete()) actions.close();
+    else if (keys.matches(data, "app.clear") && !this.editor.isShowingAutocomplete()) {
+      if (this.stops()) actions.stop();
+      else if (this.editor.getText()) this.editor.setText("");
       else actions.close();
     } else this.editor.handleInput(data);
+  }
+
+  private stops(): boolean {
+    return this.deps.stoppable() && !this.editor.getText();
   }
 
   private submitFollowUp(): void {
@@ -390,7 +394,7 @@ export class SideWindow implements Component, Focusable {
     const pieces: string[] = [];
     if (note) pieces.push(theme.fg("warning", note));
     if (this.anchor) pieces.push(theme.fg("accent", "scrolled back · ctrl+end follows"));
-    pieces.push(theme.fg("dim", `${toggleKey} main · esc ${this.deps.busy() ? "stop" : "close"} · pgup/pgdn scroll · alt+m max · alt+=/- size · /help`));
+    pieces.push(theme.fg("dim", `${toggleKey} main · esc hide · ${this.stops() ? "ctrl+c stop · " : ""}pgup/pgdn scroll · alt+m max · alt+=/- size · /help`));
     return pieces.join(theme.fg("dim", "  │  "));
   }
 

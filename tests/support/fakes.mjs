@@ -146,6 +146,8 @@ export function fakeContext({ cwd, branch = [], idle = true, rows = 40, columns 
     overlays: [],
     notes: [],
     dialogs: [],
+    statuses: new Map(),
+    statusWrites: 0,
     answers: { select: undefined, confirm: false, input: undefined, editor: undefined },
     isIdle: () => ctx.idle,
     hasPendingMessages: () => false,
@@ -153,7 +155,13 @@ export function fakeContext({ cwd, branch = [], idle = true, rows = 40, columns 
     getContextUsage: () => ({ tokens: 1000, contextWindow: 200_000, percent: 0.5 }),
     sessionManager: { getBranch: () => ctx.branch, getLeafId: () => ctx.branch.at(-1)?.id ?? null, getSessionName: () => undefined },
     ui: {
+      theme,
       notify: (message, level) => ctx.notes.push([level, message]),
+      setStatus: (key, text) => {
+        ctx.statusWrites += 1;
+        if (text === undefined) ctx.statuses.delete(key);
+        else ctx.statuses.set(key, text);
+      },
       select: async (title, options) => { ctx.dialogs.push(["select", title, options]); return ctx.answers.select; },
       confirm: async (title, message) => { ctx.dialogs.push(["confirm", title, message]); return ctx.answers.confirm; },
       input: async (title) => { ctx.dialogs.push(["input", title]); return ctx.answers.input; },
