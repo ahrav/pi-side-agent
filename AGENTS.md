@@ -50,6 +50,10 @@ Tests fail when one of these breaks. Keep them when you change the code.
   the blocks it shows. A delta re-renders only its block.
 - Every rendered line is exactly the given width, and a frame is exactly the
   window's row count.
+- Every change to `Transcript.activity()` advances `Transcript.version`.
+- Only a draw of an active window sets the spinner timer, one at a time. The
+  animation stops when pi stops drawing the window, and an idle or disposed
+  window requests no frame.
 - A callback from the side process stream or IPC channel never throws into
   the host.
 - The side agent process exits when the host stops it and when the host dies.

@@ -42,10 +42,16 @@ const markdown = (chars) => {
   return parts.join("").slice(0, chars);
 };
 
-function window(transcript, { rowCount = 54, columns = 200 } = {}) {
+function window(transcript, { rowCount = 54, columns = 200, activity } = {}) {
   const tui = fakeTui(60, columns);
   const actions = new Proxy({}, { get: () => () => {} });
-  const side = new SideWindow({ tui, theme, keys, markdownTheme, editorTheme, transcript, cwd: process.cwd(), toggleKey: "alt+a", rows: () => rowCount, busy: () => transcript.busy, title: () => "side agent · provider/model", state: () => "working…", note: () => "", actions });
+  let since = 0;
+  const running = () => {
+    const label = transcript.activity();
+    since = label ? since || performance.now() : 0;
+    return label ? { label, since } : undefined;
+  };
+  const side = new SideWindow({ tui, theme, keys, markdownTheme, editorTheme, transcript, cwd: process.cwd(), toggleKey: "alt+a", rows: () => rowCount, busy: () => transcript.busy, activity: activity ?? running, outbox: () => [], title: () => "side agent · provider/model", state: () => "working…", note: () => "", actions });
   side.focused = true;
   return { side, tui };
 }
@@ -154,6 +160,15 @@ function benchRender() {
     const cached = timed(() => side.render(184), 2001);
     report("render", `${blocks} blocks: frame at the end of the transcript, cold`, ms(first));
     report("render", `${blocks} blocks: unchanged frame`, `${(cached * 1000).toFixed(1)} µs`);
+    let since = performance.now();
+    const waiting = window(transcript, { activity: () => ({ label: "Thinking…", since }) }).side;
+    waiting.render(184);
+    const spinner = timed(() => {
+      since -= 100;
+      waiting.render(184);
+    }, 201);
+    waiting.dispose();
+    report("render", `${blocks} blocks: frame that advances the activity spinner`, `${(spinner * 1000).toFixed(1)} µs, ten a second = ${spinner.toFixed(2)}% of one core`);
   }
   for (const chars of [2000, 20_000, 80_000]) {
     const transcript = new Transcript();
@@ -173,9 +188,9 @@ function benchRender() {
 // A real pi process streams a scripted answer into a transcript. With `draw`, a window renders it through a fake
 // TUI that draws at most one frame every 16 ms. With `monitor`, the event-loop delay of this process is sampled
 // every millisecond. Sampling costs CPU, so the CPU figures come from the runs with `monitor` off.
-async function liveRun({ draw, monitor, chars, paceMs }) {
+async function liveRun({ draw, monitor, chars = 0, paceMs = 0, script }) {
   const home = fs.mkdtempSync(path.join(tmpdir(), "side-bench-"));
-  const script = [{ text: markdown(chars * 0.8), paceMs, tools: [{ name: "bash", arguments: { command: 'for i in $(seq 1 400); do echo "output line $i of the tool"; done' } }] }, { text: markdown(chars * 0.2), paceMs }];
+  script ??= [{ text: markdown(chars * 0.8), paceMs, tools: [{ name: "bash", arguments: { command: 'for i in $(seq 1 400); do echo "output line $i of the tool"; done' } }] }, { text: markdown(chars * 0.2), paceMs }];
   const pi = scriptedPi(home, script);
   const transcript = new Transcript();
   const { side, tui } = window(transcript);
@@ -245,6 +260,11 @@ async function benchLive() {
     report("live", `${label}: host CPU, window open`, `${share(open)}; ${open.frames} frames drawn in ${ms(open.renderMs)}`);
     report("live", `${label}: event-loop delay p50 / p99 / max`, `${nanos(sampled.delay.percentile(50))} / ${nanos(sampled.delay.percentile(99))} / ${nanos(sampled.delay.max)}`);
   }
+  const wait = [{ delayMs: 6000, text: "done" }];
+  const quiet = await liveRun({ draw: false, monitor: false, script: wait });
+  const spinning = await liveRun({ draw: true, monitor: false, script: wait });
+  report("live", "waiting 6 s for the model: host CPU, window closed", share(quiet));
+  report("live", "waiting 6 s for the model: host CPU, window open", `${share(spinning)}; ${spinning.frames} frames drawn in ${ms(spinning.renderMs)}`);
   const idle = monitorEventLoopDelay({ resolution: 1 });
   idle.enable();
   await new Promise((resolve) => setTimeout(resolve, 2000));

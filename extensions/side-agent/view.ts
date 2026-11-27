@@ -55,6 +55,12 @@ export interface WindowActions {
   pickModel(): void;
 }
 
+export interface Activity {
+  label: string;
+  /** `since` is a `performance.now()` reading. The window shows the time elapsed from it. */
+  since: number;
+}
+
 export interface WindowDeps {
   tui: TUI;
   theme: Paint;
@@ -66,6 +72,9 @@ export interface WindowDeps {
   toggleKey: string;
   rows(): number;
   busy(): boolean;
+  activity(): Activity | undefined;
+  /** The window renders `outbox()` entries as user messages before `transcript.queued` entries. */
+  outbox(): readonly string[];
   title(): string;
   state(): string;
   note(): string;
@@ -92,6 +101,8 @@ const TOOL_ERROR_LINES = 4;
 const MIN_FRAME_INTERVAL_MS = 50;
 const MAX_FRAME_INTERVAL_MS = 500;
 const RENDER_COST_FACTOR = 50;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 100;
 const ANSI_STYLE = /\x1b\[[0-9;]*m/g;
 
 function fit(line: string, width: number): string {
@@ -111,6 +122,11 @@ function wrapPlain(text: string, width: number): string[] {
 function duration(ms: number | undefined): string {
   if (ms === undefined) return "";
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function elapsed(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 export function renderBlock(block: Block, width: number, style: RenderStyle): string[] {
@@ -178,7 +194,9 @@ export class SideWindow implements Component, Focusable {
   private frameKey = "";
   private contentWidth = 40;
   private viewRows = 1;
+  private tailRows = 0;
   private frameTimer: NodeJS.Timeout | undefined;
+  private spinTimer: NodeJS.Timeout | undefined;
   private lastFrameAt = 0;
   private fault = "";
 
@@ -239,7 +257,9 @@ export class SideWindow implements Component, Focusable {
 
   dispose(): void {
     if (this.frameTimer) clearTimeout(this.frameTimer);
+    if (this.spinTimer) clearTimeout(this.spinTimer);
     this.frameTimer = undefined;
+    this.spinTimer = undefined;
   }
 
   invalidate(): void {
@@ -273,7 +293,11 @@ export class SideWindow implements Component, Focusable {
     const title = deps.title();
     const state = deps.state();
     const note = deps.note() || this.fault;
-    const key = `${width}:${rows}:${deps.transcript.version}:${this.revision}:${title}\n${state}\n${note}\n${editorLines.join("\n")}`;
+    const activity = deps.activity();
+    const activeMs = activity ? Math.max(0, performance.now() - activity.since) : 0;
+    const tick = activity ? Math.floor(activeMs / SPINNER_INTERVAL_MS) : -1;
+    if (activity) this.animate(activeMs);
+    const key = `${width}:${rows}:${deps.transcript.version}:${this.revision}:${tick}:${activity?.label ?? ""}:${title}\n${state}\n${note}\n${editorLines.join("\n")}`;
     if (this.frame && key === this.frameKey) return this.frame;
 
     const started = performance.now();
@@ -281,11 +305,16 @@ export class SideWindow implements Component, Focusable {
     const border = (text: string) => theme.fg(this._focused ? "borderAccent" : "border", text);
     const side = border("│");
     this.contentWidth = Math.max(8, inner - 2);
-    this.viewRows = Math.max(1, rows - editorLines.length - 3);
+    this.viewRows = Math.max(1, rows - editorLines.length - (activity ? 4 : 3));
     const body = this.picker ? this.pickerLines(this.contentWidth, this.viewRows) : this.viewport(this.contentWidth, this.viewRows);
 
     const lines: string[] = [this.topBorder(inner, title, state, border)];
     for (const line of body) lines.push(`${side} ${fit(line, this.contentWidth)} ${side}`);
+    if (activity) {
+      const spinner = SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
+      const detail = `${elapsed(activeMs)}${deps.busy() ? " · esc stops" : ""}`;
+      lines.push(`${side} ${fit(`${theme.fg("accent", `${spinner} ${activity.label}`)} ${theme.fg("dim", detail)}`, this.contentWidth)} ${side}`);
+    }
     for (const line of editorLines) {
       const rule = line.replace(ANSI_STYLE, "").startsWith("─");
       lines.push(`${rule ? border("├") : side}${fit(line, inner)}${rule ? border("┤") : side}`);
@@ -382,12 +411,26 @@ export class SideWindow implements Component, Focusable {
 
   private tail(width: number): string[] {
     const { theme, transcript } = this.deps;
-    return transcript.queued.map((text) => theme.fg("dim", truncateToWidth(`⏳ queued: ${text.replace(/\s+/g, " ")}`, width, "…")));
+    const lines: string[] = [];
+    for (const text of this.deps.outbox()) lines.push(...renderBlock({ kind: "user", id: 0, version: 0, text }, width, this.style), "");
+    for (const text of transcript.queued) lines.push(theme.fg("dim", truncateToWidth(`⏳ queued: ${text.replace(/\s+/g, " ")}`, width, "…")));
+    return lines;
+  }
+
+  /** A draw of an active window keeps one timer pending, so the animation ends when pi stops drawing the window. */
+  private animate(activeMs: number): void {
+    if (this.spinTimer) return;
+    this.spinTimer = setTimeout(() => {
+      this.spinTimer = undefined;
+      this.contentChanged();
+    }, SPINNER_INTERVAL_MS - (activeMs % SPINNER_INTERVAL_MS) + 1);
+    this.spinTimer.unref();
   }
 
   private viewport(width: number, rows: number): string[] {
     const blocks = this.deps.transcript.blocks;
     const tail = this.tail(width);
+    this.tailRows = tail.length;
     const out: string[] = [];
     const start = this.anchor ? blocks.findIndex((block) => block.id === this.anchor?.id) : -1;
     if (this.anchor && start !== -1) {
@@ -418,8 +461,8 @@ export class SideWindow implements Component, Focusable {
   }
 
   private followTop(): Position {
-    const { blocks, queued } = this.deps.transcript;
-    const need = this.viewRows - queued.length;
+    const blocks = this.deps.transcript.blocks;
+    const need = this.viewRows - this.tailRows;
     let count = 0;
     for (let index = blocks.length - 1; index >= 0; index--) {
       count += this.span(index);
@@ -429,8 +472,8 @@ export class SideWindow implements Component, Focusable {
   }
 
   private linesFrom(position: Position, limit: number): number {
-    const { blocks, queued } = this.deps.transcript;
-    let count = queued.length - position.offset;
+    const blocks = this.deps.transcript.blocks;
+    let count = this.tailRows - position.offset;
     for (let index = position.index; index < blocks.length && count <= limit; index++) count += this.span(index);
     return count;
   }

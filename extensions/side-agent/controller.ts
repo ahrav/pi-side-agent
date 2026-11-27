@@ -6,7 +6,7 @@ import { MainBridge } from "./main-bridge.ts";
 import { type Invocation, launchArgs, piInvocation, type SideExit, SideProcess } from "./process.ts";
 import { SESSION_ENTRY_TYPE, SIDE_AGENT_PROMPT } from "./protocol.ts";
 import { Transcript } from "./transcript.ts";
-import { type Keys, type PickerItem, SideWindow, type WindowActions } from "./view.ts";
+import { type Activity, type Keys, type PickerItem, SideWindow, type WindowActions } from "./view.ts";
 
 type Json = Record<string, any>;
 type Phase = "stopped" | "starting" | "ready";
@@ -69,8 +69,10 @@ export class SideAgentController {
   private ready: Promise<void> = Promise.resolve();
   private overlay: OverlayState | undefined;
   private waiting: Array<{ text: string; behavior: "steer" | "followUp" }> = [];
+  private outbox: string[] = [];
   /** A pending prompt RPC keeps the side agent's status at `working…` even when the transcript is idle. */
   private unanswered = 0;
+  private activeSince = 0;
   private dialogs: Promise<void> = Promise.resolve();
   private model: ModelRef | undefined;
   private thinking: string | undefined;
@@ -155,6 +157,7 @@ export class SideAgentController {
     if (!this.running && this.ctx) this.start(this.ctx);
     if (this.phase !== "ready") {
       this.waiting.push({ text, behavior });
+      this.outbox.push(text);
       this.refresh();
       return;
     }
@@ -253,8 +256,10 @@ export class SideAgentController {
       return;
     }
     if (record.type === "thinking_level_changed" && typeof record.level === "string") this.thinking = record.level;
+    if (this.outbox.length > 0) this.settleOutbox(record);
     const version = this.transcript.version;
     this.transcript.apply(record);
+    this.stamp();
     if (record.type === "agent_settled") {
       this.run(this.refreshUsage(process));
       if (this.overlay?.handle?.isFocused() !== true && this.ctx?.hasUI) this.ctx.ui.notify(`Side agent finished. ${this.config.toggleKey} opens it.`, "info");
@@ -263,11 +268,20 @@ export class SideAgentController {
     else if (this.transcript.version !== version) this.overlay?.window?.contentChanged();
   }
 
+  private settleOutbox(record: Json): void {
+    if (record.type === "message_start" && record.message?.role === "user") this.outbox.shift();
+    else if (record.type === "queue_update") {
+      const queued = new Set([...(record.steering ?? []), ...(record.followUp ?? [])]);
+      this.outbox = this.outbox.filter((text) => !queued.has(text));
+    } else if (record.type === "agent_settled") this.outbox = [];
+  }
+
   private onExit(process: SideProcess, exit: SideExit): void {
     if (process !== this.process) return;
     this.process = undefined;
     this.phase = "stopped";
     this.waiting = [];
+    this.outbox = [];
     this.bridge.detach();
     this.transcript.apply({ type: "agent_settled" });
     if (!this.stopping) {
@@ -323,11 +337,16 @@ export class SideAgentController {
 
   private prompt(text: string, behavior: "steer" | "followUp"): void {
     this.unanswered += 1;
+    this.refresh();
     this.run(
-      this.rpc({ type: "prompt", message: text, streamingBehavior: behavior }).finally(() => {
-        this.unanswered -= 1;
-        this.refresh();
-      }),
+      this.rpc({ type: "prompt", message: text, streamingBehavior: behavior })
+        .then((accepted) => {
+          if (!accepted) this.outbox = [];
+        })
+        .finally(() => {
+          this.unanswered -= 1;
+          this.refresh();
+        }),
     );
   }
 
@@ -478,6 +497,7 @@ export class SideAgentController {
     const result = await this.rpc({ type: "new_session" });
     if (!result || result.cancelled) return;
     this.transcript.clear();
+    this.outbox = [];
     this.usage = "";
     if (this.model) await this.rpc({ type: "set_model", provider: this.model.provider, modelId: this.model.id });
     if (this.thinking) await this.rpc({ type: "set_thinking_level", level: this.thinking });
@@ -560,13 +580,25 @@ export class SideAgentController {
   }
 
   private stateText(): string {
-    let state = this.busy() ? "working…" : "idle";
+    let state = this.busy() || this.transcript.active ? "working…" : "idle";
     if (this.phase === "starting") state = this.waiting.length > 0 ? `starting… ${this.waiting.length} queued` : "starting…";
     else if (this.phase === "stopped") state = "stopped";
     return this.usage ? `${state} · ${this.usage}` : state;
   }
 
+  private activity(): Activity | undefined {
+    const label = this.phase === "starting" ? "Starting the side agent…" : this.transcript.activity() || (this.unanswered > 0 ? "Sending…" : "");
+    return label ? { label, since: this.activeSince || performance.now() } : undefined;
+  }
+
+  /** `activeSince` holds the time the side agent last went from idle to active, and 0 while it is idle. */
+  private stamp(): void {
+    if (this.phase !== "starting" && this.unanswered === 0 && !this.transcript.active) this.activeSince = 0;
+    else if (this.activeSince === 0) this.activeSince = performance.now();
+  }
+
   private refresh(): void {
+    this.stamp();
     this.overlay?.window?.touch();
   }
 
@@ -609,6 +641,8 @@ export class SideAgentController {
             toggleKey: this.config.toggleKey,
             rows: () => windowRows(tui.terminal.rows, this.config.window),
             busy: () => this.busy(),
+            activity: () => this.activity(),
+            outbox: () => this.outbox,
             title: () => this.title(),
             state: () => this.stateText(),
             note: () => this.note,

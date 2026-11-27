@@ -60,8 +60,27 @@ editor. The window stays visible while you type to the main agent.
 
 Type in the window's composer and press Enter. The side agent starts with the
 window and is ready in the time pi takes to start: 2 to 3 seconds with a large
-configuration. A prompt you send before that waits and is sent when the side
-agent is ready.
+configuration. A prompt you send before that shows in the window at once and
+is sent when the side agent is ready.
+
+While the side agent works, a line above the composer shows a spinner, the
+current step, and the time since you sent the message:
+
+```text
+│ ❯ why does the build fail on Linux only?                                                 │
+│                                                                                          │
+│ ◐ bash cargo build --target x86_64-unknown-linux-gnu                                     │
+│                                                                                          │
+│ ⏳ queued: also check the CI log                                                         │
+│ ⠹ Running bash… 12s · esc stops                                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+```
+
+The line appears when you press Enter and stays until the run ends. Its steps
+are `Starting the side agent`, `Sending`, `Waiting for the model`, `Thinking`,
+`Responding`, `Calling <tool>`, `Running <tool>`, `Retrying`, `Finishing`, and
+`Compacting context`. A message you send during a run is queued. It shows as
+`⏳ queued` until the side agent takes it.
 
 Esc stops a running side turn. Esc on an idle window closes it. The side agent
 keeps running while the window is closed, and pi shows a notice when it
@@ -224,8 +243,11 @@ requirement:
 - While the side agent streams, frames are spaced by at least 50 ms and by 50
   times the cost of the last frame. Drawing a streaming answer of 80,000
   characters took 2% of one core. A closed window draws nothing.
+- The activity line advances ten times a second through the same frame
+  spacing. Each draw of a working window sets one timer for the next spinner
+  frame, so a closed, hidden, or idle window sets no timer.
 
-The tests check the last four of these properties.
+The tests check the last five of these properties.
 
 Measured with `npm run bench` on an Apple M5 Pro, Node 24, pi 1.6.1:
 
@@ -236,9 +258,11 @@ Measured with `npm run bench` on an Apple M5 Pro, Node 24, pi 1.6.1:
 | Draw an unchanged frame | under 1 µs |
 | Draw a frame at the end of a 10-block or 10,000-block transcript | 0.4 to 0.5 ms |
 | Draw a frame of a streaming 20,000-character answer | 1.2 ms, one frame per 61 ms |
+| Draw a frame that advances the activity spinner | 50 to 60 µs |
 | Main-process CPU while the side agent streams at 93 records/s, window closed | 1.5% of one core |
 | Same, window open | 3.3% of one core |
 | Main-process CPU at 873 records/s, window closed / open | 3.9% / 6.5% of one core |
+| Main-process CPU while the side agent waits on the model, window closed / open | 0.0% / 0.3% of one core |
 | Event-loop delay while streaming, p99 / max | 2 ms / 8 to 12 ms |
 | Event-loop delay of the same process when idle, p99 / max | 1.3 ms / 2.4 ms |
 | Side agent start with a 20-package configuration | 2.5 s until ready |
@@ -249,6 +273,12 @@ deltas a second. The 93 records/s rows are therefore the realistic case, and
 the 873 records/s row is a stress case. The stream rows use a scripted
 provider, so they measure this extension and pi's RPC stream without model
 latency.
+
+The benchmark draws only the side window. In a pi session, each spinner frame
+also makes pi redraw its screen. In one interactive session with a 20-package
+configuration, the main process used 0.32 s of CPU in 30 s (1.1% of one core)
+while the side agent ran a tool with the window open, 0.18 s with the window
+closed, and 0.06 s with the window open and the side agent idle.
 
 ## Evaluation
 

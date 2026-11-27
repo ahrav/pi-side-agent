@@ -11,6 +11,7 @@ import { alive, bridgePath, fakeContext, fakePi, KEY, scriptedPi, tempDir, until
 initTheme();
 
 const WIDTH = 110;
+const SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
 
 /**
  * A controller over a fake pi and interactive context, whose side agent is the repository's pi with
@@ -57,9 +58,12 @@ test("opening the window starts the side agent and answers a prompt typed before
   assert.equal(overlay().focused, true);
   assert.deepEqual(overlay().options.overlayOptions, { anchor: "center", width: "92%", minWidth: 40, maxHeight: "100%", margin: 0, nonCapturing: true });
   assert.match(screen(), /starting… 1 queued/);
+  assert.match(screen(), new RegExp(`❯ say hello[\\s\\S]*${SPINNER.source} Starting the side agent… 0s · esc stops +│\\n├`), "the held message and the starting line show at once");
 
   await shows(/Hello from the side\./);
   await shows(/ idle[^\n]*─╮/);
+  assert.doesNotMatch(screen(), SPINNER, "an idle window shows no activity line");
+  assert.equal(screen().match(/❯ say hello/g).length, 1, "the held message became one user message");
   assert.match(screen(), /╭─ side agent · scripted\/script ─/);
   assert.match(screen(), /❯ say hello/);
   assert.equal(screen().split("\n").length, 36, "the window is 90% of a 40-row terminal");
@@ -286,6 +290,54 @@ test("the side session resumes from the entry recorded in the main session", { t
   assert.equal(second.scripted.requests().at(-1).messages.filter((message) => message.role === "user" && JSON.stringify(message).includes("remember this")).length, 1, "the resumed request carries the earlier turn");
 });
 
+test("the window names each step of a run, counts its time, and clears the line when the run ends", { timeout: 60_000 }, async (t) => {
+  const answer = "The side agent finished the command and reports its result here.";
+  const script = [{ delayMs: 500, tools: [{ name: "bash", arguments: { command: "sleep 0.6" } }] }, { delayMs: 300, text: answer, paceMs: 40 }, { delayMs: 300, text: "second answer" }];
+  const { ctx, controller, enter, shows, screen } = setup(t, script);
+  const step = (label) => new RegExp(`${SPINNER.source} ${label} · esc stops +│\\n├`);
+  controller.open(ctx);
+  await controller.whenReady();
+  assert.doesNotMatch(screen(), SPINNER);
+
+  enter("run it");
+  await shows(step("Waiting for the model… 0s"));
+  assert.match(screen(), /❯ run it/);
+  await shows(step("Running bash… \\ds"));
+  await shows(step("Responding… [12]s"), "the time counts from the message, across the run's steps");
+  await shows(/ idle[^\n]*─╮/);
+  assert.match(screen(), /reports its result here\./);
+  assert.doesNotMatch(screen(), SPINNER, "the line clears when the run ends");
+
+  enter("again");
+  await shows(step("Waiting for the model… 0s"), "a new run counts from zero");
+  await shows(/second answer/);
+});
+
+test("a compaction shows on the activity line, and a run after it counts from zero", { timeout: 60_000 }, async (t) => {
+  const home = tempDir(t);
+  fs.mkdirSync(path.join(home, ".pi/agent"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".pi/agent/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 1 } }));
+  const { ctx, controller, enter, shows, screen, notices, overlay } = setup(t, [{ delayMs: 1300, text: "first answer" }, { delayMs: 600, text: "second answer" }], { home });
+  controller.open(ctx, "say something");
+  await shows(/first answer/);
+  await shows(/ idle[^\n]*─╮/);
+  enter("more");
+  await shows(/second answer/);
+  await shows(/ idle[^\n]*─╮/);
+
+  enter("/compact");
+  await shows(new RegExp(`${SPINNER.source} Compacting context… 0s +│\\n├`), "the compaction line without the escape hint");
+  assert.match(screen(), / working…[^\n]*─╮/);
+  assert.match(screen(), /esc close/, "escape stops no run during a compaction");
+  await shows(new RegExp(`${SPINNER.source} Compacting context… 1s`));
+
+  overlay().component.handleInput(KEY.ctrlC);
+  assert.equal(ctx.overlays.length, 0);
+  await until(() => notices().includes("Context compacted."), { label: "the compaction to end while the window is closed" });
+  controller.open(ctx, "again");
+  await shows(new RegExp(`${SPINNER.source} (Sending|Waiting for the model)… 0s`), "a run after the compaction counts from zero");
+});
+
 test("a side agent that dies is reported and restarts on the next message", { timeout: 60_000 }, async (t) => {
   const { ctx, controller, enter, shows, screen } = setup(t, [{ text: "back again" }]);
   controller.open(ctx);
@@ -297,8 +349,10 @@ test("a side agent that dies is reported and restarts on the next message", { ti
   assert.equal(controller.running, false);
 
   enter("are you there?");
+  assert.match(screen(), /❯ are you there\?[\s\S]*Starting the side agent…/, "the message that restarts the side agent shows while it starts");
   await shows(/back again/);
   assert.notEqual(controller.pid, pid);
+  assert.equal(screen().match(/❯ are you there\?/g).length, 1);
 });
 
 test("shutdown stops the side agent, closes the window, and stops listening to the main session", { timeout: 60_000 }, async (t) => {

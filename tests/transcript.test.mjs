@@ -58,16 +58,97 @@ test("a streamed turn becomes user, thinking, text, tool, and text blocks in ord
   assert.equal(transcript.lastAnswer(), "Listing now.\n\nOne file.");
 });
 
+/** A run whose first request fails and is retried, followed by a compaction. */
+function retriedTurn() {
+  return [
+    { type: "agent_start" },
+    { type: "message_start", message: { role: "user", content: "try" } },
+    { type: "message_start", message: { role: "assistant", content: [] } },
+    { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "overloaded", content: [] } },
+    { type: "auto_retry_start", attempt: 2, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded" },
+    { type: "message_start", message: { role: "assistant", content: [] } },
+    { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [] } },
+    { type: "auto_retry_end", success: true, attempt: 2 },
+    { type: "agent_settled", aborted: false },
+    { type: "compaction_start", reason: "manual" },
+    { type: "compaction_end", reason: "manual", aborted: false },
+  ];
+}
+
 test("every visible change advances the transcript version", () => {
   const transcript = new Transcript();
   let last = transcript.version;
-  for (const record of streamedTurn()) {
-    const before = JSON.stringify(describe(transcript)) + transcript.busy;
+  for (const record of [...streamedTurn(), ...retriedTurn()]) {
+    const before = JSON.stringify(describe(transcript)) + transcript.busy + transcript.activity();
     transcript.apply(record);
-    const after = JSON.stringify(describe(transcript)) + transcript.busy;
+    const after = JSON.stringify(describe(transcript)) + transcript.busy + transcript.activity();
     if (before !== after) assert.ok(transcript.version > last, `${record.type} changed the transcript without a new version`);
     last = transcript.version;
   }
+});
+
+test("activity names each step of a run and is empty between runs", () => {
+  const transcript = new Transcript();
+  assert.equal(transcript.activity(), "");
+  const steps = [];
+  for (const record of streamedTurn()) {
+    transcript.apply(record);
+    if (steps.at(-1) !== transcript.activity()) steps.push(transcript.activity());
+    assert.equal(transcript.active, transcript.activity() !== "", record.type);
+  }
+  assert.deepEqual(steps, [
+    "Waiting for the model…",
+    "Thinking…",
+    "Responding…",
+    "Calling bash…",
+    "Waiting for the model…",
+    "Running bash…",
+    "Waiting for the model…",
+    "Responding…",
+    "Finishing…",
+    "",
+  ]);
+});
+
+test("activity covers parallel tools, retries, a queued message, and compaction", () => {
+  const transcript = new Transcript();
+  const step = (record) => {
+    transcript.apply(record);
+    return transcript.activity();
+  };
+  const steps = [];
+  for (const record of retriedTurn()) if (steps.at(-1) !== step(record)) steps.push(transcript.activity());
+  assert.deepEqual(steps, ["Waiting for the model…", "Finishing…", "Retrying (2/3)…", "Waiting for the model…", "Finishing…", "", "Compacting context…", ""]);
+
+  step({ type: "agent_start" });
+  step({ type: "tool_execution_start", toolCallId: "a", toolName: "read", args: {} });
+  assert.equal(step({ type: "tool_execution_start", toolCallId: "b", toolName: "grep", args: {} }), "Running 2 tools…");
+  assert.equal(step({ type: "tool_execution_end", toolCallId: "a", toolName: "read", result: { content: [] } }), "Running grep…");
+  assert.equal(step({ type: "tool_execution_end", toolCallId: "b", toolName: "grep", result: { content: [] } }), "Waiting for the model…");
+
+  step({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "overloaded", content: [] } });
+  assert.equal(step({ type: "auto_retry_start", attempt: 2, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded" }), "Retrying (2/3)…");
+  assert.equal(step({ type: "message_start", message: { role: "assistant", content: [] } }), "Waiting for the model…");
+
+  assert.equal(step({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] } }), "Finishing…");
+  assert.equal(step({ type: "message_start", message: { role: "user", content: "a queued message" } }), "Waiting for the model…");
+  assert.equal(step({ type: "agent_settled" }), "");
+
+  assert.equal(step({ type: "compaction_start", reason: "manual" }), "Compacting context…");
+  assert.equal(transcript.busy, false);
+  assert.equal(transcript.active, true);
+  assert.equal(step({ type: "compaction_end", reason: "manual", aborted: false }), "");
+
+  step({ type: "agent_start" });
+  step({ type: "tool_execution_start", toolCallId: "c", toolName: "bash", args: {} });
+  step({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000 });
+  step({ type: "agent_settled" });
+  assert.equal(step({ type: "agent_start" }), "Waiting for the model…", "a run that ends mid-step leaves no step for the next run");
+
+  step({ type: "tool_execution_start", toolCallId: "d", toolName: "bash", args: {} });
+  transcript.clear();
+  assert.equal(transcript.activity(), "");
+  assert.equal(step({ type: "agent_start" }), "Waiting for the model…", "a cleared transcript keeps no running tool");
 });
 
 test("a delta touches only the block it extends", () => {

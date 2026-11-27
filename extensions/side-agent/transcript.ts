@@ -97,15 +97,38 @@ export class Transcript {
   /** `parts` maps content indices in the streaming assistant message to blocks. */
   private readonly parts = new Map<number, ProseBlock | ToolBlock>();
   private readonly tools = new Map<string, ToolBlock>();
+  /** `executing` maps running tool call IDs to tool names. */
+  private readonly executing = new Map<string, string>();
+  /** `part` labels the content part the model is streaming. */
+  private part = "";
+  private retrying = "";
+  private compacting = false;
+
+  get active(): boolean {
+    return this.busy || this.compacting;
+  }
+
+  /** `activity` names the step in progress while `active` is true, and is empty otherwise. */
+  activity(): string {
+    if (this.compacting) return "Compacting context…";
+    if (!this.busy) return "";
+    if (this.executing.size > 1) return `Running ${this.executing.size} tools…`;
+    for (const name of this.executing.values()) return `Running ${name}…`;
+    return this.retrying || this.part || "Waiting for the model…";
+  }
 
   apply(record: Json): void {
     switch (record.type) {
       case "agent_start":
         this.busy = true;
+        this.part = "";
         this.version += 1;
         return;
       case "agent_settled":
         this.busy = false;
+        this.executing.clear();
+        this.part = "";
+        this.retrying = "";
         this.endStreaming();
         this.version += 1;
         return;
@@ -120,6 +143,7 @@ export class Transcript {
         const tool = this.tool(record.toolCallId, record.toolName);
         tool.status = "running";
         if (!tool.args) tool.args = argsPreview(record.args);
+        this.executing.set(tool.callId, tool.name);
         return this.bump(tool);
       }
       case "tool_execution_end": {
@@ -127,6 +151,7 @@ export class Transcript {
         tool.status = record.isError ? "error" : "ok";
         tool.durationMs = typeof record.durationMs === "number" ? record.durationMs : undefined;
         tool.result = clip(contentText(record.result?.content).trimEnd(), RESULT_CHARS);
+        this.executing.delete(tool.callId);
         return this.bump(tool);
       }
       case "queue_update":
@@ -134,13 +159,17 @@ export class Transcript {
         this.version += 1;
         return;
       case "auto_retry_start":
+        this.retrying = `Retrying (${record.attempt}/${record.maxAttempts})…`;
         return this.notice("warning", `Retry ${record.attempt}/${record.maxAttempts} in ${Math.round((record.delayMs ?? 0) / 1000)}s: ${record.errorMessage ?? "request failed"}`);
       case "auto_retry_end":
+        this.retrying = "";
         if (record.success === false) this.notice("error", record.finalError ?? "Retries failed.");
         return;
       case "compaction_start":
+        this.compacting = true;
         return this.notice("info", `Compacting context (${record.reason}).`);
       case "compaction_end":
+        this.compacting = false;
         if (record.errorMessage) this.notice("error", `Compaction failed: ${record.errorMessage}`);
         else this.notice("info", record.aborted ? "Compaction aborted." : "Context compacted.");
         return;
@@ -158,6 +187,10 @@ export class Transcript {
     this.blocks.length = 0;
     this.parts.clear();
     this.tools.clear();
+    this.executing.clear();
+    this.part = "";
+    this.retrying = "";
+    this.compacting = false;
     this.queued = [];
     this.busy = false;
     this.version += 1;
@@ -189,7 +222,11 @@ export class Transcript {
   private messageStart(message: Json): void {
     if (message.role === "assistant") {
       this.parts.clear();
+      this.retrying = "";
+      this.part = "";
+      this.version += 1;
     } else if (message.role === "user") {
+      this.part = "";
       this.blocks.push({ kind: "user", id: this.nextId++, version: 0, text: contentText(message.content) });
       this.version += 1;
     } else if (message.role === "custom" && message.display === true) {
@@ -215,9 +252,13 @@ export class Transcript {
         block.text = event.content ?? block.text;
         return this.bump(block);
       }
-      case "toolcall_start":
-        this.parts.set(event.contentIndex, this.tool(event.id, event.toolName));
+      case "toolcall_start": {
+        const tool = this.tool(event.id, event.toolName);
+        this.parts.set(event.contentIndex, tool);
+        this.part = `Calling ${tool.name}…`;
+        this.version += 1;
         return;
+      }
       case "toolcall_end": {
         const tool = this.tool(event.toolCall?.id, event.toolCall?.name);
         if (!tool.args) tool.args = argsPreview(event.toolCall?.arguments);
@@ -242,6 +283,8 @@ export class Transcript {
     });
     this.endStreaming();
     this.parts.clear();
+    this.part = message.stopReason === "toolUse" ? "" : "Finishing…";
+    this.version += 1;
     if (message.stopReason === "error") this.notice("error", message.errorMessage || "The request failed.");
     else if (message.stopReason === "aborted") this.notice("warning", "Aborted.");
   }
@@ -261,6 +304,7 @@ export class Transcript {
     const block: ProseBlock = { kind, id: this.nextId++, version: 0, text: "", streaming: true };
     this.blocks.push(block);
     this.parts.set(index, block);
+    this.part = kind === "text" ? "Responding…" : "Thinking…";
     this.version += 1;
     return block;
   }

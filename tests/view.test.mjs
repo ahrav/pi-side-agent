@@ -3,7 +3,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { Transcript } from "../extensions/side-agent/transcript.ts";
 import { SideWindow } from "../extensions/side-agent/view.ts";
-import { editorTheme, fakeTui, KEY, keys, markdownTheme, theme } from "./support/fakes.mjs";
+import { editorTheme, fakeTui, KEY, keys, markdownTheme, theme, until } from "./support/fakes.mjs";
 
 const ACTIONS = ["submit", "abort", "close", "unfocus", "resize", "toggleMaximize", "cycleModel", "cycleThinking", "pickModel"];
 
@@ -12,7 +12,7 @@ function build({ rows = 30, markdown = markdownTheme, actions = {} } = {}) {
   const tui = fakeTui(rows, 120);
   const transcript = new Transcript();
   const calls = [];
-  const shown = { rows, title: "side agent · p/m", state: "idle", note: "" };
+  const shown = { rows, title: "side agent · p/m", state: "idle", note: "", activity: undefined, outbox: [] };
   const window = new SideWindow({
     tui,
     theme,
@@ -24,6 +24,8 @@ function build({ rows = 30, markdown = markdownTheme, actions = {} } = {}) {
     toggleKey: "alt+a",
     rows: () => shown.rows,
     busy: () => transcript.busy,
+    activity: () => shown.activity,
+    outbox: () => shown.outbox,
     title: () => shown.title,
     state: () => shown.state,
     note: () => shown.note,
@@ -319,4 +321,81 @@ test("an action that throws is reported in the window instead of thrown at pi", 
   assert.match(window.render(100).at(-2), /maximize failed/);
   window.handleInput("x");
   assert.doesNotMatch(window.render(100).at(-2), /maximize failed/, "the next key clears the report");
+});
+
+const SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+const activityLine = (lines) => lines[lines.findIndex((line) => line.startsWith("├")) - 1];
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("an active side agent shows a spinner, its step, and the elapsed time above the composer", () => {
+  const { window, transcript, shown } = build();
+  fill(transcript, 3);
+  const idle = window.render(100);
+  assert.doesNotMatch(body(idle), SPINNER);
+  assert.match(activityLine(idle), /^│ +│$/, "an idle window ends its transcript with a blank line");
+
+  transcript.apply({ type: "agent_start" });
+  shown.activity = { label: "Thinking…", since: performance.now() - 2350 };
+  const active = window.render(100);
+  assert.equal(active.length, 30, "the activity line takes a transcript row, and the frame keeps its height");
+  assert.match(activityLine(active), new RegExp(`^│ ${SPINNER.source} Thinking… 2s · esc stops +│$`));
+  assert.match(body(active), /answer 2/, "the end of the transcript stays in view");
+
+  shown.activity = { label: "Running bash…", since: performance.now() - 65_400 };
+  assert.match(activityLine(window.render(100)), /Running bash… 1m 05s · esc stops/);
+
+  transcript.apply({ type: "agent_settled" });
+  shown.activity = { label: "Starting the side agent…", since: performance.now() - 400 };
+  assert.match(activityLine(window.render(100)), /Starting the side agent… 0s +│$/, "escape stops nothing while the side agent starts");
+
+  for (const [width, rows] of [[44, 10], [31, 9], [200, 60]]) {
+    shown.rows = rows;
+    const lines = window.render(width);
+    assert.equal(lines.length, rows);
+    for (const line of lines) assert.equal(visibleWidth(line), width, JSON.stringify(line));
+  }
+  window.dispose();
+});
+
+test("the spinner advances while pi draws the window and requests no frame otherwise", async () => {
+  const { window, tui, shown } = build();
+  window.render(100);
+  await pause(250);
+  assert.equal(tui.renders, 0, "an idle window requests no frame");
+
+  shown.activity = { label: "Waiting for the model…", since: performance.now() };
+  const first = activityLine(window.render(100));
+  await until(() => tui.renders >= 1, { label: "a frame request for the next spinner frame" });
+  const second = activityLine(window.render(100));
+  assert.notEqual(second, first, "the next frame shows a new spinner frame");
+
+  tui.renders = 0;
+  await until(() => tui.renders >= 1, { label: "the frame request scheduled by the last draw" });
+  await pause(350);
+  assert.equal(tui.renders, 1, "a window that pi no longer draws requests one frame and stops");
+
+  window.render(100);
+  window.dispose();
+  tui.renders = 0;
+  await pause(250);
+  assert.equal(tui.renders, 0, "a disposed window requests no frame");
+});
+
+test("a message held for the side agent shows as sent, above the queued messages", () => {
+  const { window, transcript, shown } = build({ rows: 20 });
+  fill(transcript, 40);
+  shown.outbox = ["first held message", "second held\nmessage"];
+  transcript.apply({ type: "queue_update", steering: ["a queued message"], followUp: [] });
+  const following = window.render(100);
+  assert.equal(following.length, 20);
+  assert.match(body(following), /answer 39[\s\S]*❯ first held message[^\n]*\n│ +│\n│ ❯ second held[^\n]*\n│ {3}message[^\n]*\n│ +│\n│ ⏳ queued: a queued message/);
+
+  window.handleInput(KEY.pageUp);
+  assert.doesNotMatch(body(window.render(100)), /first held message/);
+  window.handleInput(KEY.pageDown);
+  assert.deepEqual(window.render(100), following, "paging back down returns to the held messages");
+
+  shown.outbox = [];
+  window.touch();
+  assert.doesNotMatch(body(window.render(100)), /held/);
 });
